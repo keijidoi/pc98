@@ -46,9 +46,6 @@ public class YM2608 : IDevice
 
     private readonly Action _raiseIrq;
 
-    // Sample generation accumulator
-    private int _sampleAccumulator;
-
     public YM2608(Action raiseIrq)
     {
         _raiseIrq = raiseIrq;
@@ -76,7 +73,6 @@ public class YM2608 : IDevice
         _timerBCounter = 0;
         _timerBEnabled = false;
         _timerBLoaded = false;
-        _sampleAccumulator = 0;
     }
 
     public int[] GetPortRange() => new[] { PORT_ADDR1, PORT_DATA1, PORT_ADDR2, PORT_DATA2 };
@@ -201,13 +197,8 @@ public class YM2608 : IDevice
         }
         else if (reg >= 0x30 && reg <= 0xBF)
         {
-            // FM ch1-3 operator/channel registers
+            // FM ch1-3 operator/channel/frequency registers
             WriteFMRegister(reg, value, 0);
-        }
-        else if (reg >= 0xA0 && reg <= 0xAF)
-        {
-            // Frequency registers for ch1-3
-            WriteFMFrequency(reg, value, 0);
         }
     }
 
@@ -217,13 +208,8 @@ public class YM2608 : IDevice
 
         if (reg >= 0x30 && reg <= 0xBF)
         {
-            // FM ch4-6 operator/channel registers
+            // FM ch4-6 operator/channel/frequency registers
             WriteFMRegister(reg, value, 3);
-        }
-        else if (reg >= 0xA0 && reg <= 0xAF)
-        {
-            // Frequency registers for ch4-6
-            WriteFMFrequency(reg, value, 3);
         }
         else if (reg >= 0x00 && reg <= 0x0D)
         {
@@ -241,18 +227,16 @@ public class YM2608 : IDevice
 
         int regBase = reg & 0xF0;
 
-        if (regBase >= 0x30 && regBase <= 0x90)
+        if (regBase >= 0xA0 && regBase <= 0xA0)
+        {
+            // Frequency registers 0xA0-0xAF
+            WriteFMFrequency(reg, value, chOffset);
+        }
+        else if (regBase >= 0x30 && regBase <= 0x90)
         {
             // Operator registers
-            // Operator mapping: reg & 0x03 = channel, (reg & 0x0C) >> 2 would be wrong
-            // Actually in OPN: registers 0x30+ch, 0x34+ch, 0x38+ch, 0x3C+ch = op0-3 for channel ch
-            // But the actual mapping is:
-            // offset 0x00, 0x01, 0x02 = ch0, ch1, ch2
-            // offset 0x04, 0x05, 0x06 = same channels but op index changes per 0x10 block
-            // Simplified: op = ((reg - regBase) / 4) maps within the 0x10 block
             // OPN operator order: 0x_0=op1, 0x_4=op3, 0x_8=op2, 0x_C=op4 (YM2608 ordering)
             int opOffset = ((reg & 0x0C) >> 2);
-            // Map to standard operator index
             int op = opOffset switch
             {
                 0 => 0, // op1
