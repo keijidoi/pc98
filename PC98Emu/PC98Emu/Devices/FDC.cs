@@ -141,7 +141,7 @@ public class FDC : IDevice
             0x06 => 8, // READ DATA
             0x05 => 8, // WRITE DATA
             0x0A => 1, // READ ID
-            0x0F => 1, // SEEK
+            0x0F => 2, // SEEK
             0x07 => 1, // RECALIBRATE
             0x08 => 0, // SENSE INTERRUPT STATUS
             _ => 0
@@ -250,17 +250,11 @@ public class FDC : IDevice
 
         _phase = Phase.Execution;
 
-        // For write, we'd need DMA transfer from memory to disk
-        // Basic implementation: read from DMA address and write to disk
+        // Read from DMA and write to disk
         for (int s = sectorStart; s <= eot; s++)
         {
             var buffer = new byte[sectorSize];
-            int addr = _dma.GetChannelAddress(2);
-            int count = Math.Min(sectorSize, _dma.GetChannelCount(2) + 1);
-            for (int i = 0; i < count && addr + i < _memory.Length; i++)
-            {
-                buffer[i] = _memory[addr + i];
-            }
+            _dma.TransferFromMemory(2, buffer, _memory);
 
             if (!disk.WriteSector(cylinder, head, s, buffer))
             {
@@ -302,13 +296,23 @@ public class FDC : IDevice
         _st1 = 0;
         _st2 = 0;
 
+        // Derive size code from disk's actual sector size
+        int sizeCode = 2; // default 512 bytes
+        var disk = _diskManager.GetFloppy(driveUnit);
+        if (disk != null)
+        {
+            int sz = disk.SectorSize;
+            sizeCode = 0;
+            while (sz > 128) { sz >>= 1; sizeCode++; }
+        }
+
         _resultBuffer[0] = _st0;
         _resultBuffer[1] = _st1;
         _resultBuffer[2] = _st2;
         _resultBuffer[3] = (byte)cyl;
         _resultBuffer[4] = (byte)head;
         _resultBuffer[5] = 1; // Sector 1
-        _resultBuffer[6] = 2; // Size code (512 bytes)
+        _resultBuffer[6] = (byte)sizeCode;
         _resultLength = 7;
         _resultIndex = 0;
         _phase = Phase.Result;

@@ -47,6 +47,19 @@ public class DMA : IDevice
         ch.Count -= data.Length;
     }
 
+    public void TransferFromMemory(int channel, byte[] buffer, byte[] memory)
+    {
+        var ch = _channels[channel];
+        int addr = ch.Address;
+        int count = Math.Min(buffer.Length, ch.Count + 1);
+        for (int i = 0; i < count && addr + i < memory.Length; i++)
+        {
+            buffer[i] = memory[addr + i];
+        }
+        ch.Address += count;
+        ch.Count -= count;
+    }
+
     public void ResetFlipFlop() => _flipFlop = false;
     public ushort ReadWord(int port) => 0xFFFF;
     public void WriteWord(int port, ushort value) { }

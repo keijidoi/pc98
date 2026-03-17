@@ -19,8 +19,10 @@ public class FDCTests
         diskMgr.MountFloppy(0, image);
 
         // Setup DMA channel 2: address=0x1000, count=511
-        dma.WriteByte(0x05, 0x00); dma.WriteByte(0x05, 0x10);
-        dma.WriteByte(0x07, 0xFF); dma.WriteByte(0x07, 0x01);
+        dma.ResetFlipFlop();
+        dma.WriteByte(0x05, 0x00); dma.WriteByte(0x05, 0x10); // ch2 addr = 0x1000
+        dma.ResetFlipFlop();
+        dma.WriteByte(0x0D, 0xFF); dma.WriteByte(0x0D, 0x01); // ch2 count = 0x01FF (511)
 
         // Issue READ DATA command: 0x06, HD|US, C, H, R, N, EOT, GPL, DTL
         fdc.WriteByte(0x92, 0x06);

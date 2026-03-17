@@ -16,8 +16,8 @@ public class GDC : IDevice
     private const byte StatusHBlank = 0x10;   // bit 4
     private const byte StatusDma = 0x08;      // bit 3
     private const byte StatusDrawing = 0x04;  // bit 2
-    private const byte StatusFifoEmpty = 0x02; // bit 1
-    private const byte StatusFifoFull = 0x01;  // bit 0
+    private const byte StatusFifoEmpty = 0x01; // bit 0
+    private const byte StatusFifoFull = 0x02;  // bit 1
 
     // Command codes
     private const byte CmdReset = 0x00;
@@ -93,7 +93,11 @@ public class GDC : IDevice
 
     public void WriteByte(int port, byte value)
     {
-        if (port == _basePort) // Even port: command/parameter
+        if (port == _basePort) // Even port (0x60/0xA0): parameter data
+        {
+            WriteParameter(value);
+        }
+        else if (port == _basePort + 2) // Odd port (0x62/0xA2): command/parameter
         {
             // If we're currently expecting parameters for an active command, treat as parameter
             if (_expectedParameters > 0 && _parameterCount < _expectedParameters)
@@ -104,10 +108,6 @@ public class GDC : IDevice
             {
                 WriteCommand(value);
             }
-        }
-        else if (port == _basePort + 2) // Odd port: parameter data
-        {
-            WriteParameter(value);
         }
     }
 
