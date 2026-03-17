@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "dgSpecHash": "RkPku/6v09Q=",
+  "success": true,
+  "projectFilePath": "C:\\FlutterProject\\pc98\\PC98Emu\\PC98Emu\\PC98Emu.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\doike\\.nuget\\packages\\ppy.sdl2-cs\\1.0.82\\ppy.sdl2-cs.1.0.82.nupkg.sha512"
+  ],
+  "logs": []
+}
