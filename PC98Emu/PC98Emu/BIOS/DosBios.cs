@@ -22,6 +22,7 @@ public class DosBios
     private ushort _dtaOff = 0x0080; // Default DTA at PSP:0080
     private byte _currentDrive; // 0=A, 1=B, 2=C...
     private byte _verifyFlag;
+    private ushort _lastError; // Last DOS error code for AH=59
 
     // Simple file handle table (handles 0-19)
     private const int MAX_HANDLES = 20;
@@ -32,7 +33,7 @@ public class DosBios
     private readonly uint[] _fileSize = new uint[MAX_HANDLES];
 
     // Memory management - block allocator with free list
-    private const ushort MEM_TOP_SEG = 0x9FC0; // Just below video RAM (A000:0000)
+    private const ushort MEM_TOP_SEG = 0x9A00; // Below video RAM; keeps COMMAND.COM data below 0xA0000 VRAM
     private readonly List<(ushort seg, ushort size)> _allocBlocks = new();
     private ushort _memBaseSeg = 0x3000; // Lowest allocation segment
 
@@ -80,7 +81,6 @@ public class DosBios
     public void HandleInt21()
     {
         byte func = _cpu.AH;
-
         switch (func)
         {
             case 0x00: // Terminate Program
@@ -180,6 +180,20 @@ public class DosBios
                 GetInterruptVector();
                 break;
 
+            case 0x36: // Get Disk Free Space
+                GetDiskFreeSpace();
+                break;
+
+            case 0x39: // Create Directory (mkdir)
+                // Stub: succeed (read-only filesystem)
+                _cpu.Flags.CF = false;
+                Console.Error.WriteLine($"[DOS] mkdir (stub, no-op)");
+                break;
+
+            case 0x3A: // Remove Directory (rmdir)
+                _cpu.Flags.CF = false;
+                break;
+
             case 0x3B: // Change Directory
                 // Stub: just succeed
                 _cpu.Flags.CF = false;
@@ -205,8 +219,26 @@ public class DosBios
                 WriteFile();
                 break;
 
+            case 0x41: // Delete File
+                // Read-only filesystem: return access denied
+                _cpu.AX = 0x05; // Access denied
+                _cpu.Flags.CF = true;
+                break;
+
             case 0x42: // Seek (LSEEK)
                 Seek();
+                break;
+
+            case 0x43: // Get/Set File Attributes
+                if (_cpu.AL == 0x00) // Get
+                {
+                    _cpu.CX = 0x0020; // Archive attribute
+                    _cpu.Flags.CF = false;
+                }
+                else // Set
+                {
+                    _cpu.Flags.CF = false; // Stub: succeed
+                }
                 break;
 
             case 0x44: // IOCTL
@@ -234,9 +266,7 @@ public class DosBios
                 break;
 
             case 0x4F: // Find Next File
-                // No more files
-                _cpu.AX = 0x12; // No more files
-                _cpu.Flags.CF = true;
+                FindNextFile();
                 break;
 
             case 0x4B: // EXEC (Load and Execute)
@@ -275,17 +305,34 @@ public class DosBios
             case 0x38: // Get/Set Country Info
                 if (_cpu.AL == 0x00 || _cpu.AL == 0x01)
                 {
-                    // Get country info → DS:DX buffer
+                    // Get country info → DS:DX buffer (34 bytes for DOS 3.3+)
                     int ciAddr = (_cpu.DS << 4) + _cpu.DX;
                     var ciMem = _bus.GetMemoryDirect();
-                    // Clear 34 bytes
                     for (int i = 0; i < 34; i++) ciMem[(ciAddr + i) & 0xFFFFF] = 0;
-                    // Date format: 2 = YY/MM/DD (Japan)
+                    // Offset 0-1: Date format (2 = YY/MM/DD Japan)
                     ciMem[ciAddr] = 0x02; ciMem[ciAddr + 1] = 0x00;
-                    // Currency symbol
-                    ciMem[ciAddr + 2] = 0x5C; // yen sign
-                    ciMem[ciAddr + 7] = 0x2C; // Thousands separator ','
-                    ciMem[ciAddr + 9] = 0x2E; // Decimal separator '.'
+                    // Offset 2-6: Currency symbol (¥ NUL-padded)
+                    ciMem[ciAddr + 2] = 0x5C; // backslash (yen in SJIS)
+                    ciMem[ciAddr + 3] = 0x00;
+                    // Offset 7-8: Thousands separator
+                    ciMem[ciAddr + 7] = 0x2C; ciMem[ciAddr + 8] = 0x00;
+                    // Offset 9-10: Decimal separator
+                    ciMem[ciAddr + 9] = 0x2E; ciMem[ciAddr + 10] = 0x00;
+                    // Offset 11-12: Date separator
+                    ciMem[ciAddr + 11] = 0x2F; ciMem[ciAddr + 12] = 0x00; // '/'
+                    // Offset 13-14: Time separator
+                    ciMem[ciAddr + 13] = 0x3A; ciMem[ciAddr + 14] = 0x00; // ':'
+                    // Offset 15: Currency format (0=symbol before, no space)
+                    ciMem[ciAddr + 15] = 0x00;
+                    // Offset 16: Digits after decimal in currency
+                    ciMem[ciAddr + 16] = 0x00;
+                    // Offset 17: Time format (0=12hr, 1=24hr)
+                    ciMem[ciAddr + 17] = 0x01; // 24hr
+                    // Offset 18-21: Case map call address (far pointer)
+                    ciMem[ciAddr + 18] = 0x00; ciMem[ciAddr + 19] = 0x00;
+                    ciMem[ciAddr + 20] = 0x00; ciMem[ciAddr + 21] = 0x00;
+                    // Offset 22-23: Data list separator
+                    ciMem[ciAddr + 22] = 0x2C; ciMem[ciAddr + 23] = 0x00; // ','
                     _cpu.BX = 0x0051; // Country code 81 = Japan
                     _cpu.Flags.CF = false;
                 }
@@ -326,6 +373,58 @@ public class DosBios
                     _cpu.DS = 0x0060;
                     _cpu.SI = 0x01F0;
                     _cpu.Flags.CF = false;
+                }
+                break;
+
+            case 0x59: // Get Extended Error Info
+                _cpu.AX = _lastError;
+                if (_lastError == 0x12) // No more files
+                {
+                    _cpu.BH = 0x01; // Class: out of resource
+                    _cpu.BL = 0x01; // Action: retry
+                    _cpu.CH = 0x01; // Locus: unknown
+                }
+                else if (_lastError == 0x02) // File not found
+                {
+                    _cpu.BH = 0x08; // Class: not found
+                    _cpu.BL = 0x01; // Action: retry
+                    _cpu.CH = 0x02; // Locus: disk
+                }
+                else
+                {
+                    _cpu.BX = 0x0000;
+                    _cpu.CX = 0x0000;
+                }
+                _cpu.Flags.CF = false;
+                break;
+
+            case 0x69: // Get/Set Disk Serial Number
+                if (_cpu.AL == 0x00) // Get
+                {
+                    // BL = drive (0=default), DS:DX = buffer
+                    int snAddr = (_cpu.DS << 4) + _cpu.DX;
+                    var snMem = _bus.GetMemoryDirect();
+                    // Info level (word) = 0
+                    snMem[(snAddr) & 0xFFFFF] = 0x00;
+                    snMem[(snAddr + 1) & 0xFFFFF] = 0x00;
+                    // Serial number (4 bytes)
+                    snMem[(snAddr + 2) & 0xFFFFF] = 0x00;
+                    snMem[(snAddr + 3) & 0xFFFFF] = 0x00;
+                    snMem[(snAddr + 4) & 0xFFFFF] = 0x00;
+                    snMem[(snAddr + 5) & 0xFFFFF] = 0x00;
+                    // Volume label (11 bytes)
+                    byte[] label = System.Text.Encoding.ASCII.GetBytes("NO NAME    ");
+                    for (int i = 0; i < 11; i++)
+                        snMem[(snAddr + 6 + i) & 0xFFFFF] = label[i];
+                    // File system type (8 bytes)
+                    byte[] fsType = System.Text.Encoding.ASCII.GetBytes("FAT16   ");
+                    for (int i = 0; i < 8; i++)
+                        snMem[(snAddr + 17 + i) & 0xFFFFF] = fsType[i];
+                    _cpu.Flags.CF = false;
+                }
+                else
+                {
+                    _cpu.Flags.CF = false; // Set: stub
                 }
                 break;
 
@@ -408,6 +507,86 @@ public class DosBios
     private bool _hasSjisLead;
     private bool _bootMenuCleaned;
 
+    // ANSI escape sequence state
+    private enum EscState { None, Esc, Csi }
+    private EscState _escState;
+    private string _escParams = "";
+
+    private void HandleEscSequence(char cmd, string parms, byte[] mem)
+    {
+        switch (cmd)
+        {
+            case 'J': // Erase in Display
+            {
+                int mode = parms.Length > 0 ? int.Parse(parms) : 0;
+                if (mode == 2)
+                {
+                    // Clear entire screen
+                    for (int a = TEXT_VRAM; a < TEXT_VRAM + 0x2000; a += 2)
+                    {
+                        mem[a] = 0x20; mem[a + 1] = 0x00;
+                    }
+                    for (int a = ATTR_VRAM; a < ATTR_VRAM + 0x2000; a += 2)
+                    {
+                        mem[a] = 0x00; mem[a + 1] = 0x00;
+                    }
+                    _cursorRow = 0;
+                    _cursorCol = 0;
+                }
+                break;
+            }
+            case 'H': // Cursor Position
+            case 'f': // Cursor Position (same)
+            {
+                string[] parts = parms.Split(';');
+                int row = parts.Length > 0 && parts[0].Length > 0 ? int.Parse(parts[0]) - 1 : 0;
+                int col = parts.Length > 1 && parts[1].Length > 0 ? int.Parse(parts[1]) - 1 : 0;
+                _cursorRow = Math.Clamp(row, 0, TEXT_ROWS - 1);
+                _cursorCol = Math.Clamp(col, 0, TEXT_COLS - 1);
+                break;
+            }
+            case 'K': // Erase in Line
+            {
+                int mode = parms.Length > 0 ? int.Parse(parms) : 0;
+                if (mode == 0)
+                {
+                    // Clear from cursor to end of line
+                    for (int c = _cursorCol; c < TEXT_COLS; c++)
+                    {
+                        int pos = (_cursorRow * TEXT_COLS + c) * 2;
+                        mem[TEXT_VRAM + pos] = 0x20; mem[TEXT_VRAM + pos + 1] = 0x00;
+                        mem[ATTR_VRAM + pos] = 0x00; mem[ATTR_VRAM + pos + 1] = 0x00;
+                    }
+                }
+                break;
+            }
+            case 'A': // Cursor Up
+            {
+                int n = parms.Length > 0 ? int.Parse(parms) : 1;
+                _cursorRow = Math.Max(0, _cursorRow - n);
+                break;
+            }
+            case 'B': // Cursor Down
+            {
+                int n = parms.Length > 0 ? int.Parse(parms) : 1;
+                _cursorRow = Math.Min(TEXT_ROWS - 1, _cursorRow + n);
+                break;
+            }
+            case 'C': // Cursor Forward
+            {
+                int n = parms.Length > 0 ? int.Parse(parms) : 1;
+                _cursorCol = Math.Min(TEXT_COLS - 1, _cursorCol + n);
+                break;
+            }
+            case 'D': // Cursor Back
+            {
+                int n = parms.Length > 0 ? int.Parse(parms) : 1;
+                _cursorCol = Math.Max(0, _cursorCol - n);
+                break;
+            }
+        }
+    }
+
     private static bool IsSjisLeadByte(byte b)
         => (b >= 0x81 && b <= 0x9F) || (b >= 0xE0 && b <= 0xFC);
 
@@ -433,6 +612,37 @@ public class DosBios
     private void DisplayChar(byte ch)
     {
         var mem = _bus.GetMemoryDirect();
+
+        // ANSI escape sequence handling (ESC [ ... letter)
+        if (_escState == EscState.Esc)
+        {
+            if (ch == (byte)'[')
+            {
+                _escState = EscState.Csi;
+                _escParams = "";
+                return;
+            }
+            _escState = EscState.None;
+            // Fall through to normal display
+        }
+        else if (_escState == EscState.Csi)
+        {
+            if (ch >= (byte)'0' && ch <= (byte)'9' || ch == (byte)';')
+            {
+                _escParams += (char)ch;
+                return;
+            }
+            // Final character - execute the sequence
+            _escState = EscState.None;
+            HandleEscSequence((char)ch, _escParams, mem);
+            return;
+        }
+
+        if (ch == 0x1B) // ESC
+        {
+            _escState = EscState.Esc;
+            return;
+        }
 
         // If we have a buffered Shift-JIS lead byte, combine with trail byte
         if (_hasSjisLead)
@@ -873,10 +1083,32 @@ public class DosBios
             {
                 _handleOpen[i] = true;
                 _filePosition[i] = 0;
-                _fileSize[i] = 0; // Unknown size (LSEEK will use default)
+                _fileSize[i] = 0;
+                _fileData[i] = null;
+
+                // Try to load file from FAT16
+                if (_fat16 != null && _fat16.IsInitialized)
+                {
+                    var (cluster, size) = _fat16.FindFile(filename);
+                    if (cluster != 0)
+                    {
+                        _fileSize[i] = size;
+                        _fileData[i] = _fat16.ReadFile(cluster, size);
+                        Console.Error.WriteLine($"[DOS] OpenFile '{filename}' → handle {i}, size={size}, loaded={_fileData[i] != null}");
+                    }
+                    else
+                    {
+                        // File not found
+                        _handleOpen[i] = false;
+                        _cpu.AX = 0x02; // File not found
+                        _cpu.Flags.CF = true;
+                        Console.Error.WriteLine($"[DOS] OpenFile '{filename}' → not found");
+                        return;
+                    }
+                }
+
                 _cpu.AX = (ushort)i;
                 _cpu.Flags.CF = false;
-                Console.Error.WriteLine($"[DOS] OpenFile '{filename}' → handle {i}");
                 return;
             }
         }
@@ -891,6 +1123,9 @@ public class DosBios
         if (handle < MAX_HANDLES)
         {
             _handleOpen[handle] = false;
+            _fileData[handle] = null;
+            _filePosition[handle] = 0;
+            _fileSize[handle] = 0;
             _cpu.Flags.CF = false;
         }
         else
@@ -903,8 +1138,44 @@ public class DosBios
     private void ReadFile()
     {
         // CX = bytes to read, BX = handle, DS:DX = buffer
-        // Stub: return 0 bytes read (EOF)
-        _cpu.AX = 0x0000;
+        ushort handle = _cpu.BX;
+        ushort count = _cpu.CX;
+        int bufAddr = (_cpu.DS << 4) + _cpu.DX;
+        var mem = _bus.GetMemoryDirect();
+
+        if (handle >= MAX_HANDLES || !_handleOpen[handle])
+        {
+            _cpu.AX = 0x06; // Invalid handle
+            _cpu.Flags.CF = true;
+            return;
+        }
+
+        // STDIN (handle 0): read from keyboard
+        if (handle == 0)
+        {
+            _cpu.AX = 0;
+            _cpu.Flags.CF = false;
+            return;
+        }
+
+        // Read from cached file data
+        byte[]? data = _fileData[handle];
+        if (data == null)
+        {
+            _cpu.AX = 0; // EOF
+            _cpu.Flags.CF = false;
+            return;
+        }
+
+        uint pos = _filePosition[handle];
+        int bytesRead = 0;
+        for (int i = 0; i < count && pos + i < data.Length; i++)
+        {
+            mem[(bufAddr + i) & 0xFFFFF] = data[pos + i];
+            bytesRead++;
+        }
+        _filePosition[handle] = pos + (uint)bytesRead;
+        _cpu.AX = (ushort)bytesRead;
         _cpu.Flags.CF = false;
     }
 
@@ -1089,6 +1360,18 @@ public class DosBios
         _cpu.Flags.CF = false;
     }
 
+    private void GetDiskFreeSpace()
+    {
+        // DL = drive (0=default, 1=A, etc.)
+        // Returns: AX=sectors/cluster, BX=free clusters, CX=bytes/sector, DX=total clusters
+        // Or AX=FFFF on error
+        _cpu.AX = 4;      // 4 sectors per cluster
+        _cpu.BX = 1000;   // 1000 free clusters
+        _cpu.CX = 512;    // 512 bytes per sector
+        _cpu.DX = 2048;   // 2048 total clusters (~4MB)
+        Console.Error.WriteLine($"[DOS] GetDiskFreeSpace drive={_cpu.DL}");
+    }
+
     private void ResizeMemory()
     {
         ushort segment = _cpu.ES;
@@ -1108,6 +1391,12 @@ public class DosBios
         _cpu.Flags.CF = false;
     }
 
+    // Handle-based search state (AH=4E/4F)
+    private List<byte[]>? _handleDirEntries;
+    private int _handleDirIndex;
+    private byte[] _handleSearchPattern83 = new byte[11];
+    private ushort _handleSearchAttr;
+
     private void FindFirstFile()
     {
         // DS:DX = ASCIIZ filespec, CX = attributes
@@ -1120,41 +1409,120 @@ public class DosBios
             if (ch == 0) break;
             filespec += (char)ch;
         }
+        _handleSearchAttr = _cpu.CX;
         Console.Error.WriteLine($"[DOS] FindFirst '{filespec}' attr={_cpu.CX:X4}");
 
-        // Check if the file exists on disk
-        if (_fat16 != null && _fat16.IsInitialized)
-        {
-            var (cluster, size) = _fat16.FindFile(filespec);
-            if (cluster != 0)
-            {
-                // Found — fill DTA with file info
-                int dtaAddr = (_dtaSeg << 4) + _dtaOff;
-                // Clear DTA (43 bytes)
-                for (int i = 0; i < 43; i++) mem[(dtaAddr + i) & 0xFFFFF] = 0;
-                // Attribute at offset 0x15
-                mem[(dtaAddr + 0x15) & 0xFFFFF] = 0x20; // Archive
-                // File size at offset 0x1A (4 bytes)
-                mem[(dtaAddr + 0x1A) & 0xFFFFF] = (byte)(size & 0xFF);
-                mem[(dtaAddr + 0x1B) & 0xFFFFF] = (byte)((size >> 8) & 0xFF);
-                mem[(dtaAddr + 0x1C) & 0xFFFFF] = (byte)((size >> 16) & 0xFF);
-                mem[(dtaAddr + 0x1D) & 0xFFFFF] = (byte)((size >> 24) & 0xFF);
-                // Filename at offset 0x1E (13 bytes ASCIIZ)
-                string name = System.IO.Path.GetFileName(filespec).ToUpperInvariant();
-                for (int i = 0; i < name.Length && i < 12; i++)
-                    mem[(dtaAddr + 0x1E + i) & 0xFFFFF] = (byte)name[i];
-                mem[(dtaAddr + 0x1E + Math.Min(name.Length, 12)) & 0xFFFFF] = 0;
+        // Convert filespec to 8.3 pattern
+        string fname = filespec;
+        int lastSlash = Math.Max(fname.LastIndexOf('\\'), fname.LastIndexOf('/'));
+        if (lastSlash >= 0) fname = fname.Substring(lastSlash + 1);
 
-                _cpu.Flags.CF = false;
-                Console.Error.WriteLine($"[DOS] FindFirst → found, size={size}");
-                return;
-            }
+        // Build 8.3 pattern (wildcards: * expands to ?)
+        for (int i = 0; i < 11; i++) _handleSearchPattern83[i] = (byte)' ';
+        int dotPos = fname.IndexOf('.');
+        string namePart = dotPos >= 0 ? fname.Substring(0, dotPos) : fname;
+        string extPart = dotPos >= 0 ? fname.Substring(dotPos + 1) : "";
+
+        // Expand * to ?s
+        if (namePart == "*") namePart = "????????";
+        if (extPart == "*") extPart = "???";
+
+        for (int i = 0; i < 8 && i < namePart.Length; i++)
+            _handleSearchPattern83[i] = (byte)char.ToUpper(namePart[i]);
+        for (int i = 0; i < 3 && i < extPart.Length; i++)
+            _handleSearchPattern83[8 + i] = (byte)char.ToUpper(extPart[i]);
+
+        // Handle bare "*" without dot: match everything
+        if (filespec.Trim() == "*" || filespec.EndsWith("\\*") || filespec.EndsWith("/*"))
+        {
+            for (int i = 0; i < 11; i++) _handleSearchPattern83[i] = (byte)'?';
         }
 
-        // Not found
-        _cpu.AX = 0x02; // File not found
+        // Load directory entries
+        if (_fat16 != null && _fat16.IsInitialized)
+            _handleDirEntries = _fat16.GetRootDirEntries();
+        else
+            _handleDirEntries = new List<byte[]>();
+
+        _handleDirIndex = 0;
+
+        // Save search state in DTA (bytes 0-20) for FindNext
+        int dtaAddr = (_dtaSeg << 4) + _dtaOff;
+        for (int i = 0; i < 11; i++)
+            mem[(dtaAddr + i) & 0xFFFFF] = _handleSearchPattern83[i];
+
+        FindNextFile();
+    }
+
+    private void FindNextFile()
+    {
+        var mem = _bus.GetMemoryDirect();
+        while (_handleDirEntries != null && _handleDirIndex < _handleDirEntries.Count)
+        {
+            byte[] entry = _handleDirEntries[_handleDirIndex++];
+            byte attr = entry[0x0B];
+
+            // Skip volume labels unless specifically requested
+            if ((attr & 0x08) != 0 && (_handleSearchAttr & 0x08) == 0) continue;
+            // Skip directories unless requested
+            if ((attr & 0x10) != 0 && (_handleSearchAttr & 0x10) == 0) continue;
+
+            // Match pattern
+            bool match = true;
+            for (int i = 0; i < 11; i++)
+            {
+                if (_handleSearchPattern83[i] == (byte)'?') continue;
+                byte e = entry[i];
+                if (e >= (byte)'a' && e <= (byte)'z') e -= 0x20;
+                if (_handleSearchPattern83[i] != e) { match = false; break; }
+            }
+            if (!match) continue;
+
+            // Fill DTA with result
+            int dtaAddr = (_dtaSeg << 4) + _dtaOff;
+            // Byte 0x15: attribute
+            mem[(dtaAddr + 0x15) & 0xFFFFF] = attr;
+            // Bytes 0x16-0x17: time
+            mem[(dtaAddr + 0x16) & 0xFFFFF] = entry[0x16];
+            mem[(dtaAddr + 0x17) & 0xFFFFF] = entry[0x17];
+            // Bytes 0x18-0x19: date
+            mem[(dtaAddr + 0x18) & 0xFFFFF] = entry[0x18];
+            mem[(dtaAddr + 0x19) & 0xFFFFF] = entry[0x19];
+            // Bytes 0x1A-0x1D: file size
+            mem[(dtaAddr + 0x1A) & 0xFFFFF] = entry[0x1C];
+            mem[(dtaAddr + 0x1B) & 0xFFFFF] = entry[0x1D];
+            mem[(dtaAddr + 0x1C) & 0xFFFFF] = entry[0x1E];
+            mem[(dtaAddr + 0x1D) & 0xFFFFF] = entry[0x1F];
+            // Bytes 0x1E+: ASCIIZ filename (8.3 with dot)
+            int namePos = 0;
+            for (int i = 0; i < 8; i++)
+            {
+                if (entry[i] != (byte)' ')
+                    mem[(dtaAddr + 0x1E + namePos++) & 0xFFFFF] = entry[i];
+            }
+            if (entry[8] != (byte)' ')
+            {
+                mem[(dtaAddr + 0x1E + namePos++) & 0xFFFFF] = (byte)'.';
+                for (int i = 8; i < 11; i++)
+                {
+                    if (entry[i] != (byte)' ')
+                        mem[(dtaAddr + 0x1E + namePos++) & 0xFFFFF] = entry[i];
+                }
+            }
+            mem[(dtaAddr + 0x1E + namePos) & 0xFFFFF] = 0; // NUL terminator
+
+            uint size = (uint)(entry[0x1C] | (entry[0x1D] << 8) | (entry[0x1E] << 16) | (entry[0x1F] << 24));
+            string dispName = "";
+            for (int i = 0; i < namePos; i++) dispName += (char)mem[(dtaAddr + 0x1E + i) & 0xFFFFF];
+            Console.Error.WriteLine($"[DOS] FindFile → '{dispName}' attr={attr:X2} size={size}");
+
+            _cpu.Flags.CF = false;
+            return;
+        }
+
+        _cpu.AX = 0x12; // No more files
+        _lastError = 0x12;
         _cpu.Flags.CF = true;
-        Console.Error.WriteLine($"[DOS] FindFirst → not found");
     }
 
     // FCB directory search state
@@ -1162,19 +1530,40 @@ public class DosBios
     private int _fcbDirIndex;
     private byte[] _fcbSearchPattern = new byte[11]; // 8.3 pattern with '?' wildcards
 
+    private byte _fcbSearchAttr; // attribute mask for FCB search
+
     private void FcbFindFirst()
     {
-        // DS:DX = unopened FCB (drive + 8.3 pattern)
+        // DS:DX = FCB (may be normal or extended)
         var mem = _bus.GetMemoryDirect();
         int fcbAddr = (_cpu.DS << 4) + _cpu.DX;
 
-        // Read search pattern from FCB (offset 1-11: 8+3 filename)
+        // Check for extended FCB (first byte = 0xFF)
+        int nameOffset;
+        if (mem[fcbAddr & 0xFFFFF] == 0xFF)
+        {
+            // Extended FCB: +0=0xFF, +1..5=reserved, +6=attr, +7=drive, +8..18=filename
+            _fcbSearchAttr = mem[(fcbAddr + 6) & 0xFFFFF];
+            nameOffset = fcbAddr + 8;
+        }
+        else
+        {
+            // Normal FCB: +0=drive, +1..11=filename
+            _fcbSearchAttr = 0;
+            nameOffset = fcbAddr + 1;
+        }
+
+        // Read search pattern (11 bytes: 8 name + 3 ext)
         for (int i = 0; i < 11; i++)
-            _fcbSearchPattern[i] = mem[(fcbAddr + 1 + i) & 0xFFFFF];
+            _fcbSearchPattern[i] = mem[(nameOffset + i) & 0xFFFFF];
 
         string pat = "";
         for (int i = 0; i < 11; i++) pat += (char)_fcbSearchPattern[i];
-        Console.Error.WriteLine($"[DOS] FCB FindFirst pattern='{pat}'");
+        // Dump raw FCB bytes for debugging
+        string hexDump = "";
+        for (int i = 0; i < 20; i++)
+            hexDump += $"{mem[((_cpu.DS << 4) + _cpu.DX + i) & 0xFFFFF]:X2} ";
+        Console.Error.WriteLine($"[DOS] FCB FindFirst pattern='{pat}' attr={_fcbSearchAttr:X2} rawFCB=[{hexDump.Trim()}]");
 
         // Load directory entries
         if (_fat16 != null && _fat16.IsInitialized)
@@ -1246,10 +1635,12 @@ public class DosBios
             Console.Error.WriteLine($"[DOS] FCB FindMatch → '{name.Trim()}' attr={attr:X2} size={size}");
 
             _cpu.AL = 0x00; // Found
+            _lastError = 0; // Clear error
             return;
         }
 
         _cpu.AL = 0xFF; // No more files
+        _lastError = 0x12; // Error 18: No more files
         Console.Error.WriteLine("[DOS] FCB FindMatch → no more files");
     }
 
