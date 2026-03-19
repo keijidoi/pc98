@@ -147,6 +147,7 @@ public class CrtBios
         byte ch = _cpu.AL;
         byte row = _bus.ReadMemoryByte(BDA_CURSOR_ROW);
         byte col = _bus.ReadMemoryByte(BDA_CURSOR_COL);
+        Console.Error.WriteLine($"[CRT] Teletype ch={ch:X2}('{(ch >= 0x20 && ch < 0x7F ? (char)ch : '?')}') at ({row},{col})");
 
         if (ch == 0x0A)
         {

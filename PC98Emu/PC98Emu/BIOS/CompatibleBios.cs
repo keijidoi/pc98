@@ -42,6 +42,7 @@ public class CompatibleBios
     // DOS INT 21h handler address in ROM area
     // 0xE8200 is taken by BootLoader.BOOT_RETURN_STUB, so use 0xE8210
     private const int INT21_ADDR = 0xE8210; // DOS functions
+    private const int INT2F_ADDR = 0xE8220; // Multiplex interrupt
 
     // BDA addresses
     private const int BDA_MEMORY_SIZE = 0x0458;   // Main memory size in KB (word)
@@ -81,6 +82,12 @@ public class CompatibleBios
     }
 
     public DiskBios? DiskBios => _diskBios;
+    public DosBios? DosBiosInstance => _dosBios;
+
+    public void SetFat16Reader(PC98Emu.Disk.Fat16Reader reader)
+    {
+        _dosBios?.SetFat16Reader(reader);
+    }
 
     public void SetDiskManager(DiskManager diskManager)
     {
@@ -282,6 +289,11 @@ public class CompatibleBios
         WriteBiosEntry(INT21_ADDR);
         _cpu.RegisterBiosHandler(INT21_ADDR, HandleInt21);
 
+        // INT 2Fh (Multiplex) handler - set IVT immediately
+        WriteBiosEntry(INT2F_ADDR);
+        _cpu.RegisterBiosHandler(INT2F_ADDR, HandleInt2FDirect);
+        WriteIVTEntry(0x2F, INT2F_ADDR);
+
         // Protect BIOS ROM
         _bus.SetBiosRomArea(true);
     }
@@ -474,9 +486,15 @@ public class CompatibleBios
     private void HandleInt21()
     {
         _int21Count++;
-        if (_int21Count <= 50)
+        if (_int21Count <= 200)
             Console.Error.WriteLine($"[INT21] #{_int21Count} AH={_cpu.AH:X2} AL={_cpu.AL:X2} BX={_cpu.BX:X4} CX={_cpu.CX:X4} DX={_cpu.DX:X4} DS={_cpu.DS:X4} ES={_cpu.ES:X4}");
         _dosBios?.HandleInt21();
+        if (_dosBios != null && _dosBios.SkipIret)
+        {
+            _dosBios.SkipIret = false;
+            // EXEC: control transferred directly to child process, don't pop old stack
+            return;
+        }
         DoIret();
     }
 
@@ -507,6 +525,11 @@ public class CompatibleBios
                 break;
             case 0x21: // DOS Functions (shouldn't reach here if IVT[21h] is set correctly)
                 _dosBios?.HandleInt21();
+                if (_dosBios != null && _dosBios.SkipIret)
+                {
+                    _dosBios.SkipIret = false;
+                    return; // EXEC: control transferred directly
+                }
                 break;
             case 0x2F: // Multiplex Interrupt
                 HandleInt2F();
@@ -550,5 +573,14 @@ public class CompatibleBios
                 _cpu.AL = 0x00;
                 break;
         }
+    }
+
+    /// <summary>
+    /// Direct INT 2Fh BIOS handler (called via IVT, needs IRET).
+    /// </summary>
+    private void HandleInt2FDirect()
+    {
+        HandleInt2F();
+        DoIret();
     }
 }

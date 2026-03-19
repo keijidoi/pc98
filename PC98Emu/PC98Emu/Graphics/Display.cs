@@ -109,14 +109,71 @@ public class Display : IDisposable
     /// <summary>
     /// Poll SDL events. Returns true if the application should continue running.
     /// </summary>
+    // Queue of key events (ASCII, scancode) from SDL
+    private readonly Queue<(byte ascii, byte scancode)> _keyQueue = new();
+
     public bool PollEvents()
     {
         while (SDL_PollEvent(out SDL_Event e) != 0)
         {
             if (e.type == SDL_EventType.SDL_QUIT)
                 return false;
+            if (e.type == SDL_EventType.SDL_KEYDOWN)
+            {
+                byte ascii = SdlKeyToAscii(e.key.keysym);
+                byte scancode = (byte)e.key.keysym.scancode;
+                if (ascii != 0)
+                    _keyQueue.Enqueue((ascii, scancode));
+            }
         }
         return true;
+    }
+
+    public bool HasKey() => _keyQueue.Count > 0;
+    public (byte ascii, byte scancode) DequeueKey() =>
+        _keyQueue.Count > 0 ? _keyQueue.Dequeue() : ((byte)0, (byte)0);
+
+    private static byte SdlKeyToAscii(SDL_Keysym keysym)
+    {
+        var key = keysym.sym;
+        var mod = keysym.mod;
+        bool shift = (mod & SDL_Keymod.KMOD_SHIFT) != 0;
+
+        if (key == SDL_Keycode.SDLK_RETURN) return 0x0D;
+        if (key == SDL_Keycode.SDLK_BACKSPACE) return 0x08;
+        if (key == SDL_Keycode.SDLK_ESCAPE) return 0x1B;
+        if (key == SDL_Keycode.SDLK_TAB) return 0x09;
+        if (key == SDL_Keycode.SDLK_SPACE) return 0x20;
+
+        // Letters
+        if (key >= SDL_Keycode.SDLK_a && key <= SDL_Keycode.SDLK_z)
+        {
+            byte ch = (byte)(key - SDL_Keycode.SDLK_a + 'a');
+            if (shift) ch = (byte)(ch - 32); // uppercase
+            return ch;
+        }
+        // Digits
+        if (key >= SDL_Keycode.SDLK_0 && key <= SDL_Keycode.SDLK_9)
+        {
+            if (shift)
+            {
+                // Shift+digit symbols
+                byte[] shiftDigits = { (byte)')', (byte)'!', (byte)'@', (byte)'#', (byte)'$',
+                                       (byte)'%', (byte)'^', (byte)'&', (byte)'*', (byte)'(' };
+                return shiftDigits[key - SDL_Keycode.SDLK_0];
+            }
+            return (byte)(key - SDL_Keycode.SDLK_0 + '0');
+        }
+        // Common punctuation
+        if (key == SDL_Keycode.SDLK_PERIOD) return shift ? (byte)'>' : (byte)'.';
+        if (key == SDL_Keycode.SDLK_COMMA) return shift ? (byte)'<' : (byte)',';
+        if (key == SDL_Keycode.SDLK_SLASH) return shift ? (byte)'?' : (byte)'/';
+        if (key == SDL_Keycode.SDLK_SEMICOLON) return shift ? (byte)':' : (byte)';';
+        if (key == SDL_Keycode.SDLK_MINUS) return shift ? (byte)'_' : (byte)'-';
+        if (key == SDL_Keycode.SDLK_EQUALS) return shift ? (byte)'+' : (byte)'=';
+        if (key == SDL_Keycode.SDLK_BACKSLASH) return shift ? (byte)'|' : (byte)'\\';
+
+        return 0; // Unknown key
     }
 
     /// <summary>

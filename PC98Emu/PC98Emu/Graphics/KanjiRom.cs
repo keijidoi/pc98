@@ -62,6 +62,7 @@ public class KanjiRom : IDisposable
     {
         try
         {
+            System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
             _hdc = CreateCompatibleDC(IntPtr.Zero);
             if (_hdc == IntPtr.Zero) return;
 
@@ -114,6 +115,7 @@ public class KanjiRom : IDisposable
         if (_available)
         {
             char ch = JisToUnicode(jisCode);
+            Console.Error.WriteLine($"[FONT] JIS {jisCode:X4} → U+{(int)ch:X4} '{ch}'");
             glyph = ch != '\0' ? RenderGlyph16(ch) : MakePlaceholder16();
         }
         else
@@ -219,14 +221,17 @@ public class KanjiRom : IDisposable
         else
         {
             sjisHi = row / 2 + 0x70;
-            sjisLo = col + 0x7D;
+            sjisLo = col + 0x7E;
         }
         if (sjisHi >= 0xA0) sjisHi += 0x40;
 
         byte[] sjis = { (byte)sjisHi, (byte)sjisLo };
-        char[] wc = new char[2];
-        int n = MultiByteToWideChar(932, 0, sjis, 2, wc, 2);
-        return n > 0 ? wc[0] : '\0';
+        try
+        {
+            string s = System.Text.Encoding.GetEncoding(932).GetString(sjis);
+            return s.Length > 0 ? s[0] : '\0';
+        }
+        catch { return '\0'; }
     }
 
     /// <summary>
@@ -240,9 +245,12 @@ public class KanjiRom : IDisposable
             return (char)(0xFF61 + (code - 0xA1));
         // Other extended ranges - try SJIS single-byte mapping
         byte[] sjis = { code };
-        char[] wc = new char[2];
-        int n = MultiByteToWideChar(932, 0, sjis, 1, wc, 2);
-        return n > 0 ? wc[0] : '\0';
+        try
+        {
+            string s = System.Text.Encoding.GetEncoding(932).GetString(sjis);
+            return s.Length > 0 ? s[0] : '\0';
+        }
+        catch { return '\0'; }
     }
 
     private static byte[] MakePlaceholder16()

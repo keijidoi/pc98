@@ -309,11 +309,12 @@ public class Emulator
         const int MSDOS_SEG_BASE = 0x0C3C0; // Physical base of segment 0C3C
         const int MSDOS_CODE_START = 0x4240; // MSDOS.SYS code starts at this offset in segment
         const int MSDOS_SAVE_END = 0xE947;   // End of area overwritten by REP MOVSW
-        const int MSDOS_HEADER_SIZE = 0x0200; // Header/dispatch data area (0000-01FF)
+        const int MSDOS_HEADER_SIZE = 0x4240; // Full dispatch+workspace area (0000-423F)
         int dosinitTraceCount = 0; // Trace counter for second DOSINIT call
         bool dosinitSecondCall = false; // Flag: second DOSINIT call is active
         int sysinitTraceCount = 0; // Trace counter for SYSINIT execution
         bool sysinitActive = false; // Flag: tracing SYSINIT
+        // commandComTraceCount removed — CMD trace disabled
         byte[]? savedIoSysRuntime = null; // IO.SYS runtime snapshot (segment 0060) saved before DOSINIT
 
         while (!quit)
@@ -400,7 +401,19 @@ public class Emulator
                                               | (pbrSector[0x1E] << 16) | (pbrSector[0x1F] << 24);
                             Console.Error.WriteLine($"[BOOT] Kernel entered CS={_cpu.CS:X4}, partition offset={hiddenSectors}");
                             if (hiddenSectors > 0 && hiddenSectors < 100000)
+                            {
                                 _bios.DiskBios?.SetPartitionOffset(hiddenSectors);
+
+                                // Initialize FAT16 reader for DOS file I/O
+                                // The PBR is at the partition start LBA
+                                int pbrLba = (1 * bootHdd.Heads + 0) * bootHdd.SectorsPerTrack;
+                                var fat16 = new PC98Emu.Disk.Fat16Reader(bootHdd, pbrLba);
+                                if (fat16.Initialize())
+                                {
+                                    fat16.ListRootDir();
+                                    _bios.SetFat16Reader(fat16);
+                                }
+                            }
                         }
                     }
 
@@ -561,17 +574,36 @@ public class Emulator
                     }
                 }
 
+                // Handle keyboard input while DOS is waiting for buffered input
+                bool dosWaiting = _bios.DosBiosInstance != null && _bios.DosBiosInstance.WaitingForInput;
+                if (dosWaiting && _display != null && _display.HasKey())
+                {
+                    var (ascii, scancode) = _display.DequeueKey();
+                    _bios.DosBiosInstance!.HandleKeyInput(ascii, scancode);
+                    // If input complete, CPU is unhalted by HandleKeyInput
+                    continue;
+                }
+
                 // Advance scheduler while halted (so timer IRQ fires)
                 // Use larger step to avoid needing 80000 iterations to reach PIT tick
                 _scheduler.Advance(100);
                 _frameCycleAccumulator += 100;
 
                 // Check for pending interrupts to wake from HLT
+                // Don't wake if DOS is waiting for keyboard input — just acknowledge the IRQ
                 if (_masterPic.HasInterrupt() && _cpu.Flags.IF)
                 {
-                    _cpu.Halted = false;
-                    int vector = _masterPic.AcknowledgeInterrupt();
-                    _cpu.Interrupt((byte)vector);
+                    if (dosWaiting)
+                    {
+                        // Just acknowledge and discard the IRQ (timer tick etc.)
+                        _masterPic.AcknowledgeInterrupt();
+                    }
+                    else
+                    {
+                        _cpu.Halted = false;
+                        int vector = _masterPic.AcknowledgeInterrupt();
+                        _cpu.Interrupt((byte)vector);
+                    }
                 }
             }
             else
@@ -1251,91 +1283,89 @@ public class Emulator
                         if (retMem[dstBase + b] != 0) nzFE++;
                     Console.Error.WriteLine($"[DOSINIT2-RET] Non-zero bytes at FE03-FFFF: {nzFE}/{0x10000 - 0xFE03}");
 
-                    // SYSINIT code at 0DA0 is broken (subroutines at 0B46 etc. were never
-                    // copied during the missing self-relocation). Instead of trying to fix
-                    // the relocation chain, inject a minimal SYSINIT replacement that:
-                    // 1. Sets default drive to A: (boot drive)
-                    // 2. Loads and executes COMMAND.COM via INT 21h AH=4B
-                    //
-                    // Write a small x86 program at 0DA0:0600:
-                    int p = dstBase + 0x0600;
-                    // Set DS = ES (DOS data segment from DOSINIT2)
-                    // MOV AX, ES_val; MOV DS, AX
-                    // Actually, just use INT 21h calls:
-                    //
-                    // Set current drive: INT 21h AH=0E, DL=boot_drive (0=A:)
-                    // EXEC COMMAND.COM: INT 21h AH=4B, AL=0, DS:DX→path, ES:BX→param_block
-                    //
-                    // Layout at 0DA0:0600:
-                    //   +0x00: code
-                    //   +0x80: COMMAND.COM path "A:\\COMMAND.COM\0"
-                    //   +0xA0: parameter block (22 bytes)
-                    //   +0xC0: command tail (empty)
+                    // Step 1: Restore MSDOS.SYS kernel data FIRST (before mini SYSINIT,
+                    // because 0C3C:0000-423F overlaps with 0DA0:0600 = 0C3C:1C40).
+                    if (savedMsdosHeader != null)
+                    {
+                        for (int b = 0; b < savedMsdosHeader.Length; b++)
+                            retMem[MSDOS_SEG_BASE + b] = savedMsdosHeader[b];
+                        Console.Error.Write("[DOSINIT2-RELOC] Restored MSDOS workspace (0000-423F): ");
+                        for (int b = 0; b < 16; b++)
+                            Console.Error.Write($"{retMem[MSDOS_SEG_BASE + b]:X2} ");
+                        Console.Error.WriteLine();
+                    }
+                    if (savedMsdosCode != null)
+                    {
+                        int codeSize = MSDOS_SAVE_END - MSDOS_CODE_START;
+                        for (int b = 0; b < codeSize; b++)
+                            retMem[MSDOS_SEG_BASE + MSDOS_CODE_START + b] = savedMsdosCode[b];
+                        Console.Error.WriteLine("[DOSINIT2-RELOC] Restored MSDOS code area (4240-E946)");
+                    }
+                    // Point INT 21h to our BIOS ROM handler. The 0C3C:0000 entry is
+                    // the DOSINIT entry point (not INT 21h handler), and 0060:3673 is
+                    // corrupted. Our DosBios implements the necessary file I/O.
+                    retMem[0x84] = 0x00; retMem[0x85] = 0x00; // offset 0x0000
+                    retMem[0x86] = 0x21; retMem[0x87] = 0xE8; // segment 0xE821 → phys 0xE8210
+                    Console.Error.WriteLine("[DOSINIT2-RELOC] Fixed INT 21h IVT → E821:0000 (BIOS ROM handler)");
+                    // Fix INT 2Fh IVT → BIOS ROM handler at 0xE8220
+                    retMem[0xBC] = 0x00; retMem[0xBD] = 0x00; // offset 0x0000
+                    retMem[0xBE] = 0x22; retMem[0xBF] = 0xE8; // segment 0xE822 → phys 0xE8220
+                    Console.Error.WriteLine("[DOSINIT2-RELOC] Fixed INT 2Fh IVT → E822:0000 (BIOS ROM handler)");
 
-                    // Write COMMAND.COM path at offset 0x80
+                    // Step 2: Inject mini SYSINIT AFTER restores (0DA0:0600 = 0C3C:1C40
+                    // overlaps with the header area we just restored, so write it last).
+                    // Place code + data at a high offset in segment 0DA0 that doesn't
+                    // overlap with 0C3C:0000-423F. 0DA0:4300 = phys 0x11D00 is safe.
+                    int miniBase = 0x4300;
+                    int miniPhys = dstBase + miniBase;
+
+                    // Write COMMAND.COM path
                     string cmdPath = "A:\\COMMAND.COM\0";
                     for (int i = 0; i < cmdPath.Length; i++)
-                        retMem[dstBase + 0x0680 + i] = (byte)cmdPath[i];
+                        retMem[miniPhys + 0x80 + i] = (byte)cmdPath[i];
 
-                    // Write empty command tail at offset 0xC0: length=0, CR
-                    retMem[dstBase + 0x06C0] = 0x00; // 0 bytes
-                    retMem[dstBase + 0x06C1] = 0x0D; // CR
+                    // Write empty command tail: length=0, CR
+                    retMem[miniPhys + 0xC0] = 0x00;
+                    retMem[miniPhys + 0xC1] = 0x0D;
 
-                    // Write parameter block at offset 0xA0:
-                    // +0: env segment (0 = inherit)
-                    // +2: command tail pointer (far ptr)
-                    // +6: FCB1 pointer (far ptr)
-                    // +10: FCB2 pointer (far ptr)
-                    int pb = dstBase + 0x06A0;
+                    // Write parameter block
+                    int pb = miniPhys + 0xA0;
                     retMem[pb + 0] = 0x00; retMem[pb + 1] = 0x00; // env = 0
-                    // command tail → 0DA0:06C0
-                    retMem[pb + 2] = 0xC0; retMem[pb + 3] = 0x06; // offset
+                    retMem[pb + 2] = (byte)((miniBase + 0xC0) & 0xFF);
+                    retMem[pb + 3] = (byte)((miniBase + 0xC0) >> 8); // offset
                     retMem[pb + 4] = 0xA0; retMem[pb + 5] = 0x0D; // segment 0DA0
-                    // FCB1 → use default (5C in PSP, but we'll point to a dummy)
-                    retMem[pb + 6] = 0x5C; retMem[pb + 7] = 0x00; // offset
-                    retMem[pb + 8] = 0xA0; retMem[pb + 9] = 0x0D; // segment 0DA0 (dummy)
-                    // FCB2
+                    retMem[pb + 6] = 0x5C; retMem[pb + 7] = 0x00;
+                    retMem[pb + 8] = 0xA0; retMem[pb + 9] = 0x0D;
                     retMem[pb + 10] = 0x6C; retMem[pb + 11] = 0x00;
                     retMem[pb + 12] = 0xA0; retMem[pb + 13] = 0x0D;
 
-                    // Write code at 0DA0:0600:
+                    // Write code
+                    ushort pathOff = (ushort)(miniBase + 0x80);
+                    ushort paramOff = (ushort)(miniBase + 0xA0);
                     byte[] miniSysinit = {
-                        // Set up segments
                         0xFC,                   // CLD
                         0xB8, 0xA0, 0x0D,       // MOV AX, 0DA0h
                         0x8E, 0xD8,             // MOV DS, AX
                         0x8E, 0xC0,             // MOV ES, AX
-                        // Set current drive to A: (drive 0)
                         0xB4, 0x0E,             // MOV AH, 0Eh (set default drive)
                         0xB2, 0x00,             // MOV DL, 0 (drive A:)
                         0xCD, 0x21,             // INT 21h
-                        // Set up stack in safe area
                         0xBC, 0x00, 0x04,       // MOV SP, 0400h
-                        // EXEC COMMAND.COM
-                        0xBA, 0x80, 0x06,       // MOV DX, 0680h (ptr to path)
-                        0xBB, 0xA0, 0x06,       // MOV BX, 06A0h (ptr to param block)
+                        (byte)0xBA, (byte)(pathOff & 0xFF), (byte)(pathOff >> 8), // MOV DX, pathOff
+                        (byte)0xBB, (byte)(paramOff & 0xFF), (byte)(paramOff >> 8), // MOV BX, paramOff
                         0xB8, 0x00, 0x4B,       // MOV AX, 4B00h (EXEC)
                         0xCD, 0x21,             // INT 21h
-                        // If EXEC returns (error), HLT
                         0xF4,                   // HLT
                     };
                     for (int i = 0; i < miniSysinit.Length; i++)
-                        retMem[dstBase + 0x0600 + i] = miniSysinit[i];
+                        retMem[miniPhys + i] = miniSysinit[i];
 
-                    // Set CPU segments for the mini SYSINIT
                     _cpu.CS = 0x0DA0;
-                    _cpu.IP = 0x0600;
+                    _cpu.IP = (ushort)miniBase;
                     _cpu.SS = 0x0DA0;
                     _cpu.SP = 0x0400;
 
-                    // Fix INT 21h IVT: DOSINIT2 sets up the kernel dispatch table at
-                    // 0C3C:0000 (JMP 01A1) but doesn't update the IVT. The old DOS stub
-                    // at 0060:3673 is corrupted. Point INT 21h to the kernel entry.
-                    retMem[0x84] = 0x00; retMem[0x85] = 0x00; // offset 0x0000
-                    retMem[0x86] = 0x3C; retMem[0x87] = 0x0C; // segment 0x0C3C
-                    Console.Error.WriteLine("[DOSINIT2-RELOC] Fixed INT 21h IVT → 0C3C:0000");
-
-                    Console.Error.WriteLine("[DOSINIT2-RELOC] Injected mini SYSINIT at 0DA0:0600 → EXEC A:\\COMMAND.COM");
+                    Console.Error.WriteLine($"[DOSINIT2-RELOC] Injected mini SYSINIT at 0DA0:{miniBase:X4} → EXEC A:\\COMMAND.COM");
 
                     sysinitActive = true;
                     sysinitTraceCount = 0;
