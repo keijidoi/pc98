@@ -579,8 +579,8 @@ public class Emulator
                 bool dosWaiting = _bios.DosBiosInstance != null && _bios.DosBiosInstance.WaitingForInput;
                 if (dosWaiting && _display != null && _display.HasKey())
                 {
-                    var (ascii, scancode) = _display.DequeueKey();
-                    _bios.DosBiosInstance!.HandleKeyInput(ascii, scancode);
+                    var (ascii, scancode, funcKey) = _display.DequeueKey();
+                    _bios.DosBiosInstance!.HandleKeyInput(ascii, scancode, funcKey);
                     // If input complete, CPU is unhalted by HandleKeyInput
                     continue;
                 }

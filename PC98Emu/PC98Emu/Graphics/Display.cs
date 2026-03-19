@@ -110,7 +110,7 @@ public class Display : IDisposable
     /// Poll SDL events. Returns true if the application should continue running.
     /// </summary>
     // Queue of key events (ASCII, scancode) from SDL
-    private readonly Queue<(byte ascii, byte scancode)> _keyQueue = new();
+    private readonly Queue<(byte ascii, byte scancode, byte funcKey)> _keyQueue = new();
 
     public bool PollEvents()
     {
@@ -122,16 +122,17 @@ public class Display : IDisposable
             {
                 byte ascii = SdlKeyToAscii(e.key.keysym);
                 byte scancode = (byte)e.key.keysym.scancode;
-                if (ascii != 0)
-                    _keyQueue.Enqueue((ascii, scancode));
+                byte funcKey = SdlKeyToFunctionKey(e.key.keysym);
+                if (ascii != 0 || funcKey != 0)
+                    _keyQueue.Enqueue((ascii, scancode, funcKey));
             }
         }
         return true;
     }
 
     public bool HasKey() => _keyQueue.Count > 0;
-    public (byte ascii, byte scancode) DequeueKey() =>
-        _keyQueue.Count > 0 ? _keyQueue.Dequeue() : ((byte)0, (byte)0);
+    public (byte ascii, byte scancode, byte funcKey) DequeueKey() =>
+        _keyQueue.Count > 0 ? _keyQueue.Dequeue() : ((byte)0, (byte)0, (byte)0);
 
     private static byte SdlKeyToAscii(SDL_Keysym keysym)
     {
@@ -172,8 +173,24 @@ public class Display : IDisposable
         if (key == SDL_Keycode.SDLK_MINUS) return shift ? (byte)'_' : (byte)'-';
         if (key == SDL_Keycode.SDLK_EQUALS) return shift ? (byte)'+' : (byte)'=';
         if (key == SDL_Keycode.SDLK_BACKSLASH) return shift ? (byte)'|' : (byte)'\\';
+        if (key == SDL_Keycode.SDLK_QUOTE) return shift ? (byte)'"' : (byte)'\'';
+        if (key == SDL_Keycode.SDLK_LEFTBRACKET) return shift ? (byte)'{' : (byte)'[';
+        if (key == SDL_Keycode.SDLK_RIGHTBRACKET) return shift ? (byte)'}' : (byte)']';
+        if (key == SDL_Keycode.SDLK_BACKQUOTE) return shift ? (byte)'~' : (byte)'`';
 
         return 0; // Unknown key
+    }
+
+    /// <summary>
+    /// Map SDL key to PC-98 function key code (0 if not a function key).
+    /// Returns 1-10 for F1-F10.
+    /// </summary>
+    private static byte SdlKeyToFunctionKey(SDL_Keysym keysym)
+    {
+        var key = keysym.sym;
+        if (key >= SDL_Keycode.SDLK_F1 && key <= SDL_Keycode.SDLK_F10)
+            return (byte)(key - SDL_Keycode.SDLK_F1 + 1);
+        return 0;
     }
 
     /// <summary>

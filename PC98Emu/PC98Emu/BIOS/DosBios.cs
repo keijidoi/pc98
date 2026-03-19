@@ -800,38 +800,136 @@ public class DosBios
     private int _inputMaxLen;
     private ushort _savedRetIP, _savedRetCS, _savedRetFlags;
 
+    // Previous command buffer for function key editing (F1-F5, F9)
+    private byte[] _prevCommand = Array.Empty<byte>();
+    private int _prevCmdCursor; // Position in previous command for F1/F4 copy/skip
+    private bool _insertMode; // F8 toggle
+    private bool _waitingForF2Char; // F2: waiting for target character
+    private bool _waitingForF5Char; // F5: waiting for target character
+
     /// <summary>
     /// Called by emulator when a key is pressed during WaitingForInput state.
+    /// funcKey: 1-10 for F1-F10, 0 for normal key.
     /// Returns true if input is complete (Enter pressed).
     /// </summary>
-    public bool HandleKeyInput(byte ascii, byte scancode)
+    public bool HandleKeyInput(byte ascii, byte scancode, byte funcKey = 0)
     {
         if (!WaitingForInput) return false;
         var mem = _bus.GetMemoryDirect();
 
         int curLen = mem[(_inputBufPhys + 1) & 0xFFFFF];
 
+        // F2/F5: waiting for a target character
+        if (_waitingForF2Char && ascii >= 0x20)
+        {
+            _waitingForF2Char = false;
+            // Copy from previous command up to (but not including) the target character
+            for (int i = _prevCmdCursor; i < _prevCommand.Length && curLen < _inputMaxLen - 1; i++)
+            {
+                if (_prevCommand[i] == ascii) { _prevCmdCursor = i; break; }
+                mem[(_inputBufPhys + 2 + curLen) & 0xFFFFF] = _prevCommand[i];
+                curLen++;
+                DisplayChar(_prevCommand[i]);
+                _prevCmdCursor = i + 1;
+            }
+            mem[(_inputBufPhys + 1) & 0xFFFFF] = (byte)curLen;
+            return false;
+        }
+        if (_waitingForF5Char && ascii >= 0x20)
+        {
+            _waitingForF5Char = false;
+            // Skip in previous command up to (but not including) the target character
+            for (int i = _prevCmdCursor; i < _prevCommand.Length; i++)
+            {
+                if (_prevCommand[i] == ascii) { _prevCmdCursor = i; return false; }
+                _prevCmdCursor = i + 1;
+            }
+            return false;
+        }
+
+        // Handle function keys
+        if (funcKey != 0)
+        {
+            switch (funcKey)
+            {
+                case 1: // F1 = C1: Copy one character from previous command
+                    if (_prevCmdCursor < _prevCommand.Length && curLen < _inputMaxLen - 1)
+                    {
+                        byte ch = _prevCommand[_prevCmdCursor++];
+                        mem[(_inputBufPhys + 2 + curLen) & 0xFFFFF] = ch;
+                        curLen++;
+                        mem[(_inputBufPhys + 1) & 0xFFFFF] = (byte)curLen;
+                        DisplayChar(ch);
+                    }
+                    break;
+
+                case 2: // F2 = CU: Copy up to specified character
+                    _waitingForF2Char = true;
+                    break;
+
+                case 3: // F3 = CA: Copy all remaining from previous command
+                    while (_prevCmdCursor < _prevCommand.Length && curLen < _inputMaxLen - 1)
+                    {
+                        byte ch = _prevCommand[_prevCmdCursor++];
+                        mem[(_inputBufPhys + 2 + curLen) & 0xFFFFF] = ch;
+                        curLen++;
+                        DisplayChar(ch);
+                    }
+                    mem[(_inputBufPhys + 1) & 0xFFFFF] = (byte)curLen;
+                    break;
+
+                case 4: // F4 = S1: Skip one character in previous command
+                    if (_prevCmdCursor < _prevCommand.Length)
+                        _prevCmdCursor++;
+                    break;
+
+                case 5: // F5 = SU: Skip up to specified character
+                    _waitingForF5Char = true;
+                    break;
+
+                case 6: // F6 = VOID: Insert Ctrl+Z (EOF)
+                case 10: // F10 = ^Z: Insert Ctrl+Z (EOF)
+                    if (curLen < _inputMaxLen - 1)
+                    {
+                        mem[(_inputBufPhys + 2 + curLen) & 0xFFFFF] = 0x1A;
+                        curLen++;
+                        mem[(_inputBufPhys + 1) & 0xFFFFF] = (byte)curLen;
+                        DisplayChar((byte)'^');
+                        DisplayChar((byte)'Z');
+                    }
+                    break;
+
+                case 7: // F7 = NWL: Newline (submit current input)
+                    ascii = 0x0D;
+                    break; // Fall through to Enter handling below
+
+                case 8: // F8 = INS: Toggle insert mode
+                    _insertMode = !_insertMode;
+                    break;
+
+                case 9: // F9 = REP: Replace - not yet implemented (would need char input)
+                    break;
+            }
+            if (funcKey != 7) return false; // F7 falls through to Enter
+        }
+
         if (ascii == 0x0D) // Enter
         {
+            // Save current input as previous command
+            _prevCommand = new byte[curLen];
+            for (int i = 0; i < curLen; i++)
+                _prevCommand[i] = mem[(_inputBufPhys + 2 + i) & 0xFFFFF];
+            _prevCmdCursor = 0;
+
             mem[(_inputBufPhys + 2 + curLen) & 0xFFFFF] = 0x0D;
             DisplayChar(0x0D);
             DisplayChar(0x0A);
             WaitingForInput = false;
-            // Restore CPU to the caller of INT 21h
             _cpu.IP = _savedRetIP;
             _cpu.CS = _savedRetCS;
             _cpu.Flags.Value = _savedRetFlags;
             _cpu.Halted = false;
-            // Dump input buffer content
-            var bufSb = new System.Text.StringBuilder();
-            bufSb.Append($"[DOS] Input complete: {curLen} chars: ");
-            for (int bi = 0; bi < curLen + 2; bi++)
-                bufSb.Append($"{mem[(_inputBufPhys + bi) & 0xFFFFF]:X2} ");
-            bufSb.Append(" → '");
-            for (int bi = 0; bi < curLen; bi++)
-                bufSb.Append((char)mem[(_inputBufPhys + 2 + bi) & 0xFFFFF]);
-            bufSb.Append($"' resume at {_savedRetCS:X4}:{_savedRetIP:X4}");
-            Console.Error.WriteLine(bufSb.ToString());
+            Console.Error.WriteLine($"[DOS] Input complete: {curLen} chars, resume at {_savedRetCS:X4}:{_savedRetIP:X4}");
             return true;
         }
 
@@ -844,6 +942,8 @@ public class DosBios
                 DisplayChar(0x08);
                 DisplayChar((byte)' ');
                 DisplayChar(0x08);
+                // Also back up the previous command cursor if applicable
+                if (_prevCmdCursor > 0) _prevCmdCursor--;
             }
             return false;
         }
@@ -854,6 +954,8 @@ public class DosBios
             curLen++;
             mem[(_inputBufPhys + 1) & 0xFFFFF] = (byte)curLen;
             DisplayChar(ascii);
+            // Advance previous command cursor in parallel
+            if (_prevCmdCursor < _prevCommand.Length) _prevCmdCursor++;
         }
 
         return false;
