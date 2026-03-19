@@ -1,0 +1,51 @@
+# Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# User-specific files
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docuser
+
+# Build outputs
+*.dll
+*.exe
+*.pdb
+
+# NuGet
+**/[Pp]ackages/*
+*.nupkg
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vs/
+.vscode/
+*.swp
+*~
+
+# Emulator logs
+emu_stdout.log
+emu_stderr.log
+
+# Test disk images
+*.d88
+*.hdi
+*.hdm
+*.nhd
+*.nfd
+*.fdi
+
+# Python
+__pycache__/
+*.pyc

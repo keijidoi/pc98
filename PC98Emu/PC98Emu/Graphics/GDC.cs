@@ -34,6 +34,12 @@ public class GDC : IDevice
 
     // State
     public bool DisplayEnabled { get; private set; }
+
+    /// <summary>Enable display (equivalent to CmdStart via I/O).</summary>
+    public void Start() => DisplayEnabled = true;
+
+    /// <summary>Disable display (equivalent to CmdStop via I/O).</summary>
+    public void Stop() => DisplayEnabled = false;
     public ushort CursorAddress { get; private set; }
     public byte Pitch { get; private set; } = 40; // default pitch
 

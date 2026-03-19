@@ -28,7 +28,24 @@ public class TimerBios
             case 0x04:
                 ReadDate();
                 break;
+            case 0x01:
+                // Set tick count - accept and ignore
+                _cpu.AH = 0;
+                break;
+            case 0x03:
+                // Set RTC time - accept and ignore
+                _cpu.AH = 0;
+                break;
+            case 0x05:
+                // Set RTC date - accept and ignore
+                _cpu.AH = 0;
+                break;
+            case 0x10:
+                // Function 10h: used by MS-DOS kernel during init - return success
+                _cpu.AH = 0;
+                break;
             default:
+                Console.Error.WriteLine($"[TIMER] Unhandled INT 1Ah AH={func:X2} AL={_cpu.AL:X2} BX={_cpu.BX:X4} CX={_cpu.CX:X4} DX={_cpu.DX:X4} DS={_cpu.DS:X4} ES={_cpu.ES:X4} CS={_cpu.CS:X4} IP={_cpu.IP:X4}");
                 _cpu.AH = 0;
                 break;
         }

@@ -4,6 +4,8 @@ namespace PC98Emu.CPU;
 
 public static class Instructions
 {
+    private static readonly HashSet<int> _warnedOpcodes = new();
+
     #region ALU Helpers
 
     public static byte Add8(V30 cpu, byte a, byte b, bool withCarry = false)
@@ -325,6 +327,10 @@ public static class Instructions
 
     public static int Execute(V30 cpu, SystemBus bus, byte opcode, bool rep, bool repZ, int segOverride)
     {
+        // Handle 32-bit operand size prefix
+        if (cpu.OperandSize32)
+            return Execute32(cpu, bus, opcode, segOverride);
+
         switch (opcode)
         {
             #region ADD 0x00-0x05
@@ -1427,9 +1433,14 @@ public static class Instructions
             case 0xCD: // INT imm8
             {
                 byte vector = cpu.FetchByte();
+                if (vector == 0) Console.Error.WriteLine($"[INT0] Software INT 0 at {cpu.CS:X4}:{(ushort)(cpu.IP - 2):X4} AX={cpu.AX:X4} BX={cpu.BX:X4} CX={cpu.CX:X4} DX={cpu.DX:X4} DS={cpu.DS:X4} ES={cpu.ES:X4} SS={cpu.SS:X4} SP={cpu.SP:X4}");
                 cpu.Interrupt(vector);
                 return 51;
             }
+            case 0xCE: // INTO - Interrupt on Overflow
+                if (cpu.Flags.OF)
+                    cpu.Interrupt(4);
+                return 4;
             case 0xCF: // IRET
             {
                 cpu.IP = cpu.Pop();
@@ -1440,6 +1451,27 @@ public static class Instructions
             #endregion
 
             #region Shift/Rotate Group 2: 0xD0-0xD3
+            #region 0xC0/0xC1 Shift/Rotate with imm8 count (80186)
+            case 0xC0: // Group 2 r/m8, imm8
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                byte val = cpu.ReadModRM8();
+                byte count = cpu.FetchByte();
+                cpu.WriteModRM8(ShiftRotate8(cpu, cpu.ModRM.Reg, val, count));
+                return 5;
+            }
+            case 0xC1: // Group 2 r/m16, imm8
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                ushort val = cpu.ReadModRM16();
+                byte count = cpu.FetchByte();
+                cpu.WriteModRM16(ShiftRotate16(cpu, cpu.ModRM.Reg, val, count));
+                return 5;
+            }
+            #endregion
+
             case 0xD0: // Group 2 r/m8, 1
             {
                 byte modrm = cpu.FetchByte();
@@ -1480,6 +1512,7 @@ public static class Instructions
                 byte imm = cpu.FetchByte();
                 if (imm == 0)
                 {
+                    Console.Error.WriteLine($"[DIV0] AAM by zero at {cpu.CS:X4}:{(ushort)(cpu.IP - 2):X4} AX={cpu.AX:X4}");
                     cpu.Interrupt(0);
                     return 83;
                 }
@@ -1495,6 +1528,46 @@ public static class Instructions
                 cpu.AH = 0;
                 cpu.Flags.UpdateSZP16(cpu.AX);
                 return 60;
+            }
+            #endregion
+
+            #region 0x9B FWAIT
+            case 0x9B: // FWAIT - wait for FPU (NOP without FPU)
+                return 1;
+            #endregion
+
+            #region 0x63 ARPL (NOP in real mode)
+            case 0x63:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                // ARPL is undefined in real mode, skip it
+                return 3;
+            }
+            #endregion
+
+            #region 0xD8-0xDF FPU instructions (skip)
+            case 0xD8: case 0xD9: case 0xDA: case 0xDB:
+            case 0xDC: case 0xDD: case 0xDE: case 0xDF:
+            {
+                // Skip FPU instructions by reading ModRM and any memory operand
+                byte modrm = cpu.FetchByte();
+                int mod = modrm >> 6;
+                if (mod != 3) // memory operand
+                {
+                    cpu.DecodeModRM16(modrm);
+                    // For opcodes like FILD/FISTP that reference memory, we just decoded the address
+                }
+                // mod=3 means register-to-register FPU op (ST(i)), no additional bytes
+                return 2;
+            }
+            #endregion
+
+            #region 0xD6 SALC (undocumented)
+            case 0xD6: // SALC - Set AL to CF
+            {
+                cpu.AL = cpu.Flags.CF ? (byte)0xFF : (byte)0x00;
+                return 3;
             }
             #endregion
 
@@ -1674,11 +1747,11 @@ public static class Instructions
                     case 6: // DIV r/m8
                     {
                         byte val = cpu.ReadModRM8();
-                        if (val == 0) { cpu.Interrupt(0); return 1; }
+                        if (val == 0) { Console.Error.WriteLine($"[DIV0] DIV8 by zero at {cpu.CS:X4}:{(ushort)(cpu.IP - 2):X4} AX={cpu.AX:X4} BX={cpu.BX:X4} CX={cpu.CX:X4} DX={cpu.DX:X4} DS={cpu.DS:X4} ES={cpu.ES:X4} SP={cpu.SP:X4}"); cpu.Interrupt(0); return 1; }
                         ushort num = cpu.AX;
                         int quot = num / val;
                         int rem = num % val;
-                        if (quot > 0xFF) { cpu.Interrupt(0); return 1; }
+                        if (quot > 0xFF) { Console.Error.WriteLine($"[DIV0] DIV8 overflow at {cpu.CS:X4}:{(ushort)(cpu.IP - 2):X4} AX={cpu.AX:X4}/{val:X2} quot={quot:X4}"); cpu.Interrupt(0); return 1; }
                         cpu.AL = (byte)quot;
                         cpu.AH = (byte)rem;
                         break;
@@ -1686,11 +1759,11 @@ public static class Instructions
                     case 7: // IDIV r/m8
                     {
                         byte val = cpu.ReadModRM8();
-                        if (val == 0) { cpu.Interrupt(0); return 1; }
+                        if (val == 0) { Console.Error.WriteLine($"[DIV0] IDIV8 by zero at {cpu.CS:X4}:{(ushort)(cpu.IP - 2):X4} AX={cpu.AX:X4} DS={cpu.DS:X4} SP={cpu.SP:X4}"); cpu.Interrupt(0); return 1; }
                         short num = (short)cpu.AX;
                         int quot = num / (sbyte)val;
                         int rem = num % (sbyte)val;
-                        if (quot > 127 || quot < -128) { cpu.Interrupt(0); return 1; }
+                        if (quot > 127 || quot < -128) { Console.Error.WriteLine($"[DIV0] IDIV8 overflow at {cpu.CS:X4}:{(ushort)(cpu.IP - 2):X4} AX={cpu.AX:X4}/{val:X2} quot={quot}"); cpu.Interrupt(0); return 1; }
                         cpu.AL = (byte)quot;
                         cpu.AH = (byte)rem;
                         break;
@@ -1750,11 +1823,11 @@ public static class Instructions
                     case 6: // DIV r/m16
                     {
                         ushort val = cpu.ReadModRM16();
-                        if (val == 0) { cpu.Interrupt(0); return 1; }
+                        if (val == 0) { Console.Error.WriteLine($"[DIV0] DIV16 by zero at {cpu.CS:X4}:{(ushort)(cpu.IP - 2):X4} DX:AX={cpu.DX:X4}:{cpu.AX:X4} BX={cpu.BX:X4} CX={cpu.CX:X4} DS={cpu.DS:X4} ES={cpu.ES:X4} SP={cpu.SP:X4}"); cpu.Interrupt(0); return 1; }
                         uint num = (uint)((cpu.DX << 16) | cpu.AX);
                         uint quot = num / val;
                         uint rem = num % val;
-                        if (quot > 0xFFFF) { cpu.Interrupt(0); return 1; }
+                        if (quot > 0xFFFF) { Console.Error.WriteLine($"[DIV0] DIV16 overflow at {cpu.CS:X4}:{(ushort)(cpu.IP - 2):X4} DX:AX={cpu.DX:X4}:{cpu.AX:X4}/{val:X4} quot={quot:X8}"); cpu.Interrupt(0); return 1; }
                         cpu.AX = (ushort)quot;
                         cpu.DX = (ushort)rem;
                         break;
@@ -1762,11 +1835,11 @@ public static class Instructions
                     case 7: // IDIV r/m16
                     {
                         ushort val = cpu.ReadModRM16();
-                        if (val == 0) { cpu.Interrupt(0); return 1; }
+                        if (val == 0) { Console.Error.WriteLine($"[DIV0] IDIV16 by zero at {cpu.CS:X4}:{(ushort)(cpu.IP - 2):X4} DX:AX={cpu.DX:X4}:{cpu.AX:X4} DS={cpu.DS:X4} SP={cpu.SP:X4}"); cpu.Interrupt(0); return 1; }
                         int num = (int)((cpu.DX << 16) | cpu.AX);
                         int quot = num / (short)val;
                         int rem = num % (short)val;
-                        if (quot > 32767 || quot < -32768) { cpu.Interrupt(0); return 1; }
+                        if (quot > 32767 || quot < -32768) { Console.Error.WriteLine($"[DIV0] IDIV16 overflow at {cpu.CS:X4}:{(ushort)(cpu.IP - 2):X4} DX:AX={cpu.DX:X4}:{cpu.AX:X4}/{val:X4} quot={quot}"); cpu.Interrupt(0); return 1; }
                         cpu.AX = (ushort)quot;
                         cpu.DX = (ushort)rem;
                         break;
@@ -1882,8 +1955,293 @@ public static class Instructions
             }
             #endregion
 
+            #region 80186 extensions
+
+            #region 0x60 PUSHA
+            case 0x60:
+            {
+                ushort temp = cpu.SP;
+                cpu.Push(cpu.AX);
+                cpu.Push(cpu.CX);
+                cpu.Push(cpu.DX);
+                cpu.Push(cpu.BX);
+                cpu.Push(temp);
+                cpu.Push(cpu.BP);
+                cpu.Push(cpu.SI);
+                cpu.Push(cpu.DI);
+                return 36;
+            }
+            #endregion
+
+            #region 0x61 POPA
+            case 0x61:
+            {
+                cpu.DI = cpu.Pop();
+                cpu.SI = cpu.Pop();
+                cpu.BP = cpu.Pop();
+                cpu.Pop(); // skip SP
+                cpu.BX = cpu.Pop();
+                cpu.DX = cpu.Pop();
+                cpu.CX = cpu.Pop();
+                cpu.AX = cpu.Pop();
+                return 51;
+            }
+            #endregion
+
+            #region 0x62 BOUND
+            case 0x62:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                // Just decode and skip - BOUND rarely triggers on valid data
+                cpu.ReadModRM16(); // consume the memory operand
+                return 13;
+            }
+            #endregion
+
+            #region 0x68 PUSH imm16
+            case 0x68:
+            {
+                ushort imm = cpu.FetchWord();
+                cpu.Push(imm);
+                return 3;
+            }
+            #endregion
+
+            #region 0x69 IMUL r16, r/m16, imm16
+            case 0x69:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                ushort rm = cpu.ReadModRM16();
+                ushort imm = cpu.FetchWord();
+                int result = (short)rm * (short)imm;
+                cpu.SetRegister16(cpu.ModRM.Reg, (ushort)result);
+                cpu.Flags.CF = cpu.Flags.OF = (result != (short)(ushort)result);
+                return 26;
+            }
+            #endregion
+
+            #region 0x6A PUSH imm8 (sign-extended)
+            case 0x6A:
+            {
+                byte imm = cpu.FetchByte();
+                cpu.Push((ushort)(short)(sbyte)imm);
+                return 3;
+            }
+            #endregion
+
+            #region 0x6B IMUL r16, r/m16, imm8
+            case 0x6B:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                ushort rm = cpu.ReadModRM16();
+                byte imm = cpu.FetchByte();
+                int result = (short)rm * (sbyte)imm;
+                cpu.SetRegister16(cpu.ModRM.Reg, (ushort)result);
+                cpu.Flags.CF = cpu.Flags.OF = (result != (short)(ushort)result);
+                return 26;
+            }
+            #endregion
+
+            #region 0xC8 ENTER
+            case 0xC8:
+            {
+                ushort size = cpu.FetchWord();
+                byte level = cpu.FetchByte();
+                cpu.Push(cpu.BP);
+                ushort framePtr = cpu.SP;
+                if (level > 0)
+                {
+                    for (int i = 1; i < level; i++)
+                    {
+                        cpu.BP -= 2;
+                        cpu.Push(bus.ReadMemoryWord(V30.GetPhysicalAddress(cpu.SS, cpu.BP)));
+                    }
+                    cpu.Push(framePtr);
+                }
+                cpu.BP = framePtr;
+                cpu.SP -= size;
+                return 15;
+            }
+            #endregion
+
+            #region 0xC9 LEAVE
+            case 0xC9:
+            {
+                cpu.SP = cpu.BP;
+                cpu.BP = cpu.Pop();
+                return 5;
+            }
+            #endregion
+
+            #region 0x6C/0x6D INS
+            case 0x6C: // INSB
+            {
+                byte val = bus.ReadIoByte(cpu.DX);
+                bus.WriteMemoryByte(V30.GetPhysicalAddress(cpu.ES, cpu.DI), val);
+                cpu.DI = (ushort)(cpu.Flags.DF ? cpu.DI - 1 : cpu.DI + 1);
+                return 14;
+            }
+            case 0x6D: // INSW
+            {
+                ushort val = (ushort)(bus.ReadIoByte(cpu.DX) | (bus.ReadIoByte((ushort)(cpu.DX + 1)) << 8));
+                bus.WriteMemoryWord(V30.GetPhysicalAddress(cpu.ES, cpu.DI), val);
+                cpu.DI = (ushort)(cpu.Flags.DF ? cpu.DI - 2 : cpu.DI + 2);
+                return 14;
+            }
+            #endregion
+
+            #region 0x6E/0x6F OUTS
+            case 0x6E: // OUTSB
+            {
+                int srcSeg = cpu.SegmentOverride >= 0 ? cpu.SegmentOverride : 3;
+                byte val = bus.ReadMemoryByte(V30.GetPhysicalAddress(cpu.GetSegmentRegister(srcSeg), cpu.SI));
+                bus.WriteIoByte(cpu.DX, val);
+                cpu.SI = (ushort)(cpu.Flags.DF ? cpu.SI - 1 : cpu.SI + 1);
+                return 14;
+            }
+            case 0x6F: // OUTSW
+            {
+                int srcSeg = cpu.SegmentOverride >= 0 ? cpu.SegmentOverride : 3;
+                int addr = V30.GetPhysicalAddress(cpu.GetSegmentRegister(srcSeg), cpu.SI);
+                ushort val = bus.ReadMemoryWord(addr);
+                bus.WriteIoByte(cpu.DX, (byte)val);
+                bus.WriteIoByte((ushort)(cpu.DX + 1), (byte)(val >> 8));
+                cpu.SI = (ushort)(cpu.Flags.DF ? cpu.SI - 2 : cpu.SI + 2);
+                return 14;
+            }
+            #endregion
+
+            #endregion
+
+            #region 0x0F two-byte opcodes (286+/386+ extensions)
+            case 0x0F:
+            {
+                byte op2 = cpu.FetchByte();
+                return ExecuteTwoByteOpcode(cpu, bus, op2);
+            }
+            #endregion
+
             default:
-                return 1; // Unimplemented: skip silently
+                { int key = (opcode << 16) | (cpu.CS << 4) + cpu.IP - 1; if (_warnedOpcodes.Add(key)) Console.Error.WriteLine($"[CPU] Unimplemented opcode 0x{opcode:X2} at {cpu.CS:X4}:{(ushort)(cpu.IP - 1):X4}"); }
+                return 1;
+        }
+    }
+
+    private static int ExecuteTwoByteOpcode(V30 cpu, SystemBus bus, byte op2)
+    {
+        switch (op2)
+        {
+            // Jcc rel16 (0x80-0x8F)
+            case 0x80: // JO rel16
+            case 0x81: // JNO rel16
+            case 0x82: // JB/JC rel16
+            case 0x83: // JNB/JNC rel16
+            case 0x84: // JZ/JE rel16
+            case 0x85: // JNZ/JNE rel16
+            case 0x86: // JBE/JNA rel16
+            case 0x87: // JNBE/JA rel16
+            case 0x88: // JS rel16
+            case 0x89: // JNS rel16
+            case 0x8A: // JP rel16
+            case 0x8B: // JNP rel16
+            case 0x8C: // JL rel16
+            case 0x8D: // JNL/JGE rel16
+            case 0x8E: // JLE/JNG rel16
+            case 0x8F: // JNLE/JG rel16
+            {
+                short rel = (short)cpu.FetchWord();
+                bool cond = (op2 & 0x0F) switch
+                {
+                    0x0 => cpu.Flags.OF,
+                    0x1 => !cpu.Flags.OF,
+                    0x2 => cpu.Flags.CF,
+                    0x3 => !cpu.Flags.CF,
+                    0x4 => cpu.Flags.ZF,
+                    0x5 => !cpu.Flags.ZF,
+                    0x6 => cpu.Flags.CF || cpu.Flags.ZF,
+                    0x7 => !cpu.Flags.CF && !cpu.Flags.ZF,
+                    0x8 => cpu.Flags.SF,
+                    0x9 => !cpu.Flags.SF,
+                    0xA => cpu.Flags.PF,
+                    0xB => !cpu.Flags.PF,
+                    0xC => cpu.Flags.SF != cpu.Flags.OF,
+                    0xD => cpu.Flags.SF == cpu.Flags.OF,
+                    0xE => cpu.Flags.ZF || (cpu.Flags.SF != cpu.Flags.OF),
+                    0xF => !cpu.Flags.ZF && (cpu.Flags.SF == cpu.Flags.OF),
+                    _ => false
+                };
+                if (cond)
+                    cpu.IP = (ushort)(cpu.IP + rel);
+                return 3;
+            }
+
+            // MOVZX r16, r/m8
+            case 0xB6:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                byte val = cpu.ReadModRM8();
+                cpu.SetRegister16(cpu.ModRM.Reg, val);
+                return 3;
+            }
+
+            // MOVSX r16, r/m8
+            case 0xBE:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                byte val = cpu.ReadModRM8();
+                cpu.SetRegister16(cpu.ModRM.Reg, (ushort)(short)(sbyte)val);
+                return 3;
+            }
+
+            // SETcc r/m8 (0x90-0x9F)
+            case 0x90: case 0x91: case 0x92: case 0x93:
+            case 0x94: case 0x95: case 0x96: case 0x97:
+            case 0x98: case 0x99: case 0x9A: case 0x9B:
+            case 0x9C: case 0x9D: case 0x9E: case 0x9F:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                bool cond = (op2 & 0x0F) switch
+                {
+                    0x0 => cpu.Flags.OF,
+                    0x1 => !cpu.Flags.OF,
+                    0x2 => cpu.Flags.CF,
+                    0x3 => !cpu.Flags.CF,
+                    0x4 => cpu.Flags.ZF,
+                    0x5 => !cpu.Flags.ZF,
+                    0x6 => cpu.Flags.CF || cpu.Flags.ZF,
+                    0x7 => !cpu.Flags.CF && !cpu.Flags.ZF,
+                    0x8 => cpu.Flags.SF,
+                    0x9 => !cpu.Flags.SF,
+                    0xA => cpu.Flags.PF,
+                    0xB => !cpu.Flags.PF,
+                    0xC => cpu.Flags.SF != cpu.Flags.OF,
+                    0xD => cpu.Flags.SF == cpu.Flags.OF,
+                    0xE => cpu.Flags.ZF || (cpu.Flags.SF != cpu.Flags.OF),
+                    0xF => !cpu.Flags.ZF && (cpu.Flags.SF == cpu.Flags.OF),
+                    _ => false
+                };
+                cpu.WriteModRM8(cond ? (byte)1 : (byte)0);
+                return 4;
+            }
+
+            // SHLD/SHRD (0xA4/0xA5/0xAC/0xAD) - just skip with ModRM
+            case 0xA4: case 0xA5: case 0xAC: case 0xAD:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                cpu.FetchByte(); // imm8 or CL
+                return 3;
+            }
+
+            default:
+                { int key = (0x0F00 | op2) << 16 | (cpu.CS << 4) + cpu.IP - 2; if (_warnedOpcodes.Add(key)) Console.Error.WriteLine($"[CPU] Unimplemented two-byte opcode 0x0F 0x{op2:X2} at {cpu.CS:X4}:{(ushort)(cpu.IP - 2):X4}"); }
+                return 1;
         }
     }
 
@@ -1977,6 +2335,438 @@ public static class Instructions
         ushort val = bus.ReadMemoryWord(addr);
         Sub16(cpu, cpu.AX, val);
         cpu.DI = (ushort)(cpu.Flags.DF ? cpu.DI - 2 : cpu.DI + 2);
+    }
+
+    #endregion
+
+    #region 32-bit operand size handling (0x66 prefix)
+
+    /// <summary>
+    /// Handles instructions with 0x66 operand size prefix.
+    /// Converts 16-bit operations to 32-bit equivalents for the most common instructions.
+    /// </summary>
+    private static int Execute32(V30 cpu, SystemBus bus, byte opcode, int segOverride)
+    {
+        switch (opcode)
+        {
+            // MOV r32, r/m32
+            case 0x8B:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                uint val = cpu.ReadModRM32();
+                cpu.SetRegister32(cpu.ModRM.Reg, val);
+                return 2;
+            }
+            // MOV r/m32, r32
+            case 0x89:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                cpu.WriteModRM32(cpu.GetRegister32(cpu.ModRM.Reg));
+                return 2;
+            }
+            // MOV r32, imm32 (0xB8-0xBF)
+            case 0xB8: case 0xB9: case 0xBA: case 0xBB:
+            case 0xBC: case 0xBD: case 0xBE: case 0xBF:
+            {
+                int reg = opcode - 0xB8;
+                uint imm = cpu.FetchDWord();
+                cpu.SetRegister32(reg, imm);
+                return 2;
+            }
+            // XOR r32, r/m32
+            case 0x33:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                uint rm = cpu.ReadModRM32();
+                uint reg = cpu.GetRegister32(cpu.ModRM.Reg);
+                uint result = reg ^ rm;
+                cpu.SetRegister32(cpu.ModRM.Reg, result);
+                cpu.Flags.CF = false;
+                cpu.Flags.OF = false;
+                cpu.Flags.UpdateSZP16((ushort)result); // approximate
+                cpu.Flags.ZF = result == 0;
+                cpu.Flags.SF = (result & 0x80000000) != 0;
+                return 3;
+            }
+            // XOR r/m32, r32
+            case 0x31:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                uint rm = cpu.ReadModRM32();
+                uint reg = cpu.GetRegister32(cpu.ModRM.Reg);
+                uint result = rm ^ reg;
+                cpu.WriteModRM32(result);
+                cpu.Flags.CF = false;
+                cpu.Flags.OF = false;
+                cpu.Flags.ZF = result == 0;
+                cpu.Flags.SF = (result & 0x80000000) != 0;
+                return 3;
+            }
+            // ADD r/m32, r32
+            case 0x01:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                uint rm = cpu.ReadModRM32();
+                uint reg = cpu.GetRegister32(cpu.ModRM.Reg);
+                ulong result = (ulong)rm + reg;
+                cpu.WriteModRM32((uint)result);
+                cpu.Flags.CF = result > 0xFFFFFFFF;
+                cpu.Flags.ZF = (uint)result == 0;
+                cpu.Flags.SF = ((uint)result & 0x80000000) != 0;
+                return 3;
+            }
+            // ADD r32, r/m32
+            case 0x03:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                uint rm = cpu.ReadModRM32();
+                uint reg = cpu.GetRegister32(cpu.ModRM.Reg);
+                ulong result = (ulong)reg + rm;
+                cpu.SetRegister32(cpu.ModRM.Reg, (uint)result);
+                cpu.Flags.CF = result > 0xFFFFFFFF;
+                cpu.Flags.ZF = (uint)result == 0;
+                cpu.Flags.SF = ((uint)result & 0x80000000) != 0;
+                return 3;
+            }
+            // SUB r32, r/m32
+            case 0x2B:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                uint rm = cpu.ReadModRM32();
+                uint reg = cpu.GetRegister32(cpu.ModRM.Reg);
+                uint result = reg - rm;
+                cpu.SetRegister32(cpu.ModRM.Reg, result);
+                cpu.Flags.CF = reg < rm;
+                cpu.Flags.ZF = result == 0;
+                cpu.Flags.SF = (result & 0x80000000) != 0;
+                return 3;
+            }
+            // CMP r32, r/m32
+            case 0x3B:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                uint rm = cpu.ReadModRM32();
+                uint reg = cpu.GetRegister32(cpu.ModRM.Reg);
+                uint result = reg - rm;
+                cpu.Flags.CF = reg < rm;
+                cpu.Flags.ZF = result == 0;
+                cpu.Flags.SF = (result & 0x80000000) != 0;
+                cpu.Flags.OF = ((reg ^ rm) & (reg ^ result) & 0x80000000) != 0;
+                return 3;
+            }
+            // CMP r/m32, r32
+            case 0x39:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                uint rm = cpu.ReadModRM32();
+                uint reg = cpu.GetRegister32(cpu.ModRM.Reg);
+                uint result = rm - reg;
+                cpu.Flags.CF = rm < reg;
+                cpu.Flags.ZF = result == 0;
+                cpu.Flags.SF = (result & 0x80000000) != 0;
+                cpu.Flags.OF = ((rm ^ reg) & (rm ^ result) & 0x80000000) != 0;
+                return 3;
+            }
+            // AND r32, r/m32
+            case 0x23:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                uint rm = cpu.ReadModRM32();
+                uint reg = cpu.GetRegister32(cpu.ModRM.Reg);
+                uint result = reg & rm;
+                cpu.SetRegister32(cpu.ModRM.Reg, result);
+                cpu.Flags.CF = false;
+                cpu.Flags.OF = false;
+                cpu.Flags.ZF = result == 0;
+                cpu.Flags.SF = (result & 0x80000000) != 0;
+                return 3;
+            }
+            // OR r32, r/m32
+            case 0x0B:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                uint rm = cpu.ReadModRM32();
+                uint reg = cpu.GetRegister32(cpu.ModRM.Reg);
+                uint result = reg | rm;
+                cpu.SetRegister32(cpu.ModRM.Reg, result);
+                cpu.Flags.CF = false;
+                cpu.Flags.OF = false;
+                cpu.Flags.ZF = result == 0;
+                cpu.Flags.SF = (result & 0x80000000) != 0;
+                return 3;
+            }
+            // TEST r/m32, r32
+            case 0x85:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                uint rm = cpu.ReadModRM32();
+                uint reg = cpu.GetRegister32(cpu.ModRM.Reg);
+                uint result = rm & reg;
+                cpu.Flags.CF = false;
+                cpu.Flags.OF = false;
+                cpu.Flags.ZF = result == 0;
+                cpu.Flags.SF = (result & 0x80000000) != 0;
+                return 3;
+            }
+            // PUSH r32 (0x50-0x57)
+            case 0x50: case 0x51: case 0x52: case 0x53:
+            case 0x54: case 0x55: case 0x56: case 0x57:
+            {
+                cpu.Push32(cpu.GetRegister32(opcode - 0x50));
+                return 2;
+            }
+            // POP r32 (0x58-0x5F)
+            case 0x58: case 0x59: case 0x5A: case 0x5B:
+            case 0x5C: case 0x5D: case 0x5E: case 0x5F:
+            {
+                cpu.SetRegister32(opcode - 0x58, cpu.Pop32());
+                return 2;
+            }
+            // INC r32 (0x40-0x47)
+            case 0x40: case 0x41: case 0x42: case 0x43:
+            case 0x44: case 0x45: case 0x46: case 0x47:
+            {
+                int reg = opcode - 0x40;
+                uint val = cpu.GetRegister32(reg);
+                uint result = val + 1;
+                cpu.SetRegister32(reg, result);
+                cpu.Flags.ZF = result == 0;
+                cpu.Flags.SF = (result & 0x80000000) != 0;
+                cpu.Flags.OF = val == 0x7FFFFFFF;
+                return 2;
+            }
+            // DEC r32 (0x48-0x4F)
+            case 0x48: case 0x49: case 0x4A: case 0x4B:
+            case 0x4C: case 0x4D: case 0x4E: case 0x4F:
+            {
+                int reg = opcode - 0x48;
+                uint val = cpu.GetRegister32(reg);
+                uint result = val - 1;
+                cpu.SetRegister32(reg, result);
+                cpu.Flags.ZF = result == 0;
+                cpu.Flags.SF = (result & 0x80000000) != 0;
+                cpu.Flags.OF = val == 0x80000000;
+                return 2;
+            }
+            // MOV EAX, [addr]
+            case 0xA1:
+            {
+                ushort offset = cpu.FetchWord();
+                int seg = segOverride >= 0 ? segOverride : 3;
+                int addr = V30.GetPhysicalAddress(cpu.GetSegmentRegister(seg), offset);
+                cpu.EAX = (uint)(bus.ReadMemoryByte(addr) |
+                                  (bus.ReadMemoryByte(addr + 1) << 8) |
+                                  (bus.ReadMemoryByte(addr + 2) << 16) |
+                                  (bus.ReadMemoryByte(addr + 3) << 24));
+                return 4;
+            }
+            // MOV [addr], EAX
+            case 0xA3:
+            {
+                ushort offset = cpu.FetchWord();
+                int seg = segOverride >= 0 ? segOverride : 3;
+                int addr = V30.GetPhysicalAddress(cpu.GetSegmentRegister(seg), offset);
+                bus.WriteMemoryByte(addr, (byte)cpu.EAX);
+                bus.WriteMemoryByte(addr + 1, (byte)(cpu.EAX >> 8));
+                bus.WriteMemoryByte(addr + 2, (byte)(cpu.EAX >> 16));
+                bus.WriteMemoryByte(addr + 3, (byte)(cpu.EAX >> 24));
+                return 4;
+            }
+            // PUSH imm32
+            case 0x68:
+            {
+                uint imm = cpu.FetchDWord();
+                cpu.Push32(imm);
+                return 3;
+            }
+            // ADD/OR/ADC/SBB/AND/SUB/XOR/CMP r/m32, imm32 (Group 1)
+            case 0x81:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                uint rm = cpu.ReadModRM32();
+                uint imm = cpu.FetchDWord();
+                uint result = 0;
+                switch (cpu.ModRM.Reg)
+                {
+                    case 0: // ADD
+                        result = rm + imm;
+                        cpu.Flags.CF = (ulong)rm + imm > 0xFFFFFFFF;
+                        cpu.WriteModRM32(result);
+                        break;
+                    case 1: // OR
+                        result = rm | imm;
+                        cpu.Flags.CF = false; cpu.Flags.OF = false;
+                        cpu.WriteModRM32(result);
+                        break;
+                    case 4: // AND
+                        result = rm & imm;
+                        cpu.Flags.CF = false; cpu.Flags.OF = false;
+                        cpu.WriteModRM32(result);
+                        break;
+                    case 5: // SUB
+                        result = rm - imm;
+                        cpu.Flags.CF = rm < imm;
+                        cpu.WriteModRM32(result);
+                        break;
+                    case 6: // XOR
+                        result = rm ^ imm;
+                        cpu.Flags.CF = false; cpu.Flags.OF = false;
+                        cpu.WriteModRM32(result);
+                        break;
+                    case 7: // CMP
+                        result = rm - imm;
+                        cpu.Flags.CF = rm < imm;
+                        cpu.Flags.OF = ((rm ^ imm) & (rm ^ result) & 0x80000000) != 0;
+                        break;
+                    default:
+                        cpu.WriteModRM32(rm); // no-op for unhandled
+                        break;
+                }
+                cpu.Flags.ZF = result == 0;
+                cpu.Flags.SF = (result & 0x80000000) != 0;
+                return 3;
+            }
+            // Group 1 r/m32, imm8 (sign-extended)
+            case 0x83:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                uint rm = cpu.ReadModRM32();
+                uint imm = (uint)(int)(sbyte)cpu.FetchByte();
+                uint result = 0;
+                switch (cpu.ModRM.Reg)
+                {
+                    case 0: result = rm + imm; cpu.Flags.CF = (ulong)rm + imm > 0xFFFFFFFF; cpu.WriteModRM32(result); break;
+                    case 1: result = rm | imm; cpu.Flags.CF = false; cpu.WriteModRM32(result); break;
+                    case 4: result = rm & imm; cpu.Flags.CF = false; cpu.WriteModRM32(result); break;
+                    case 5: result = rm - imm; cpu.Flags.CF = rm < imm; cpu.WriteModRM32(result); break;
+                    case 6: result = rm ^ imm; cpu.Flags.CF = false; cpu.WriteModRM32(result); break;
+                    case 7: result = rm - imm; cpu.Flags.CF = rm < imm; cpu.Flags.OF = ((rm ^ imm) & (rm ^ result) & 0x80000000) != 0; break;
+                    default: cpu.WriteModRM32(rm); break;
+                }
+                cpu.Flags.ZF = result == 0;
+                cpu.Flags.SF = (result & 0x80000000) != 0;
+                return 3;
+            }
+            // SHL/SHR/SAR r/m32, imm8
+            case 0xC1:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                uint val = cpu.ReadModRM32();
+                byte count = (byte)(cpu.FetchByte() & 0x1F);
+                uint result = val;
+                switch (cpu.ModRM.Reg)
+                {
+                    case 4: // SHL
+                        if (count > 0) { cpu.Flags.CF = ((val >> (32 - count)) & 1) != 0; result = val << count; }
+                        break;
+                    case 5: // SHR
+                        if (count > 0) { cpu.Flags.CF = ((val >> (count - 1)) & 1) != 0; result = val >> count; }
+                        break;
+                    case 7: // SAR
+                        if (count > 0) { cpu.Flags.CF = (((int)val >> (count - 1)) & 1) != 0; result = (uint)((int)val >> count); }
+                        break;
+                    case 0: // ROL
+                        if (count > 0) { result = (val << count) | (val >> (32 - count)); cpu.Flags.CF = (result & 1) != 0; }
+                        break;
+                    case 1: // ROR
+                        if (count > 0) { result = (val >> count) | (val << (32 - count)); cpu.Flags.CF = (result & 0x80000000) != 0; }
+                        break;
+                }
+                cpu.WriteModRM32(result);
+                cpu.Flags.ZF = result == 0;
+                cpu.Flags.SF = (result & 0x80000000) != 0;
+                return 5;
+            }
+            // MOV r/m32, imm32
+            case 0xC7:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                uint imm = cpu.FetchDWord();
+                cpu.WriteModRM32(imm);
+                return 3;
+            }
+            // XCHG EAX, r32 (0x91-0x97) + NOP (0x90)
+            case 0x90: return 1; // NOP
+            case 0x91: case 0x92: case 0x93:
+            case 0x94: case 0x95: case 0x96: case 0x97:
+            {
+                int reg = opcode - 0x90;
+                uint tmp = cpu.EAX;
+                cpu.EAX = cpu.GetRegister32(reg);
+                cpu.SetRegister32(reg, tmp);
+                return 3;
+            }
+            // MOVS dword
+            case 0xA5:
+            {
+                int srcSeg = segOverride >= 0 ? segOverride : 3;
+                int srcAddr = V30.GetPhysicalAddress(cpu.GetSegmentRegister(srcSeg), cpu.SI);
+                int dstAddr = V30.GetPhysicalAddress(cpu.ES, cpu.DI);
+                for (int i = 0; i < 4; i++)
+                    bus.WriteMemoryByte(dstAddr + i, bus.ReadMemoryByte(srcAddr + i));
+                cpu.SI = (ushort)(cpu.Flags.DF ? cpu.SI - 4 : cpu.SI + 4);
+                cpu.DI = (ushort)(cpu.Flags.DF ? cpu.DI - 4 : cpu.DI + 4);
+                return 5;
+            }
+            // STOS dword
+            case 0xAB:
+            {
+                int dstAddr = V30.GetPhysicalAddress(cpu.ES, cpu.DI);
+                bus.WriteMemoryByte(dstAddr, (byte)cpu.EAX);
+                bus.WriteMemoryByte(dstAddr + 1, (byte)(cpu.EAX >> 8));
+                bus.WriteMemoryByte(dstAddr + 2, (byte)(cpu.EAX >> 16));
+                bus.WriteMemoryByte(dstAddr + 3, (byte)(cpu.EAX >> 24));
+                cpu.DI = (ushort)(cpu.Flags.DF ? cpu.DI - 4 : cpu.DI + 4);
+                return 4;
+            }
+            // PUSHFD
+            case 0x9C:
+            {
+                cpu.Push32((uint)cpu.Flags.Value);
+                return 4;
+            }
+            // POPFD
+            case 0x9D:
+            {
+                cpu.Flags.Value = (ushort)cpu.Pop32();
+                return 5;
+            }
+            // LEA r32, m (same encoding as 16-bit)
+            case 0x8D:
+            {
+                byte modrm = cpu.FetchByte();
+                cpu.DecodeModRM16(modrm);
+                cpu.SetRegister32(cpu.ModRM.Reg, (uint)(ushort)cpu.ModRMOffset);
+                return 2;
+            }
+            // 0x0F two-byte opcodes with 32-bit operand size
+            case 0x0F:
+            {
+                byte op2 = cpu.FetchByte();
+                return ExecuteTwoByteOpcode(cpu, bus, op2);
+            }
+
+            default:
+                // Fall back to 16-bit execution for unhandled 0x66 prefixed opcodes
+                cpu.OperandSize32 = false;
+                return Execute(cpu, bus, opcode, false, false, segOverride);
+        }
     }
 
     #endregion

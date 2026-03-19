@@ -5,7 +5,38 @@
       "Bash(dotnet sln:*)",
       "Bash(dotnet add:*)",
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(dotnet test:*)",
+      "Bash(dotnet build:*)",
+      "Bash(dotnet run:*)",
+      "Bash(dotnet script:*)",
+      "Read(//c/Users/doike/Downloads/Makyouden [T-En by Retronomicon v1.00]/**)",
+      "Bash(echo \"EXIT CODE: $?\")",
+      "Bash(xxd -l 256 'C:\\\\Users\\\\doike\\\\Downloads\\\\Makyouden [T-En by Retronomicon v1.00]\\\\Makyouden [T-En by Retronomicon v1.00].hdi')",
+      "Read(//c/Users/doike/Downloads/**)",
+      "Bash(taskkill //F //PID 3260)",
+      "Bash(taskkill //F //IM PC98Emu.exe)",
+      "Bash(xxd -s 0 -l 32 \"C:/Users/doike/Downloads/Makyouden [T-En by Retronomicon v1.00]/Makyouden [T-En by Retronomicon v1.00].hdi\")",
+      "Bash(xxd -s 0x1000 -l 512 \"C:/Users/doike/Downloads/Makyouden [T-En by Retronomicon v1.00]/Makyouden [T-En by Retronomicon v1.00].hdi\")",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:en.wikipedia.org)",
+      "WebFetch(domain:api.github.com)",
+      "WebFetch(domain:www.webtech.co.jp)",
+      "WebFetch(domain:hackipedia.org)",
+      "WebFetch(domain:www.os2museum.com)",
+      "WebFetch(domain:retrocomputing.stackexchange.com)",
+      "Read(//c/Users/doike/AppData/Local/Temp/claude/c--FlutterProject-pc98/9d196435-14a4-4441-b425-78fc5b8a1c12/tasks/**)",
+      "Bash(HDM=\"/c/Users/doike/Downloads/Makyouden [T-En by Retronomicon v1.00]/Makyouden \\(Boot Disk - Must Be in FD Drive 2\\).hdm\")",
+      "Bash(HDI=\"/c/Users/doike/Downloads/Makyouden [T-En by Retronomicon v1.00]/Makyouden [T-En by Retronomicon v1.00].hdi\")",
+      "Bash(HDM_PATH=\"C:\\\\Users\\\\doike\\\\Downloads\\\\Makyouden [T-En by Retronomicon v1.00]\\\\Makyouden \\(Boot Disk - Must Be in FD Drive 2\\).hdm\")",
+      "Bash(HDI_PATH=\"C:\\\\Users\\\\doike\\\\Downloads\\\\Makyouden [T-En by Retronomicon v1.00]\\\\Makyouden [T-En by Retronomicon v1.00].hdi\")",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(python3:*)",
+      "Bash(/c/Python313/python C:/FlutterProject/pc98/PC98Emu/parse_hdi.py)"
+    ],
+    "additionalDirectories": [
+      "\\tmp"
     ]
   }
 }

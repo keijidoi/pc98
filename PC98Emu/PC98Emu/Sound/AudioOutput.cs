@@ -31,37 +31,48 @@ public class AudioOutput : IDisposable
         _ym2608 = ym2608;
     }
 
-    public void Init()
+    public bool Init()
     {
-        if (_initialized) return;
+        if (_initialized) return true;
 
-        if (SDL.SDL_Init(SDL.SDL_INIT_AUDIO) < 0)
+        try
         {
-            throw new InvalidOperationException($"SDL audio init failed: {SDL.SDL_GetError()}");
+            if (SDL.SDL_Init(SDL.SDL_INIT_AUDIO) < 0)
+            {
+                Console.Error.WriteLine($"SDL audio init failed: {SDL.SDL_GetError()}");
+                return false;
+            }
+
+            _callbackDelegate = AudioCallback;
+
+            var desired = new SDL.SDL_AudioSpec
+            {
+                freq = SAMPLE_RATE,
+                format = SDL.AUDIO_S16,
+                channels = CHANNELS,
+                samples = BUFFER_SAMPLES,
+                callback = _callbackDelegate
+            };
+
+            // Use empty string for default device (ppy.SDL2-CS doesn't handle null)
+            _audioDevice = SDL.SDL_OpenAudioDevice(
+                string.Empty, 0, ref desired, out _, 0);
+
+            if (_audioDevice == 0)
+            {
+                Console.Error.WriteLine($"SDL_OpenAudioDevice failed: {SDL.SDL_GetError()}");
+                return false;
+            }
+
+            SDL.SDL_PauseAudioDevice(_audioDevice, 0);
+            _initialized = true;
+            return true;
         }
-
-        _callbackDelegate = AudioCallback;
-
-        var desired = new SDL.SDL_AudioSpec
+        catch (Exception ex)
         {
-            freq = SAMPLE_RATE,
-            format = SDL.AUDIO_S16,
-            channels = CHANNELS,
-            samples = BUFFER_SAMPLES,
-            callback = _callbackDelegate
-        };
-
-        _audioDevice = SDL.SDL_OpenAudioDevice(
-            null, 0, ref desired, out _, 0);
-
-        if (_audioDevice == 0)
-        {
-            throw new InvalidOperationException($"SDL_OpenAudioDevice failed: {SDL.SDL_GetError()}");
+            Console.Error.WriteLine($"Audio init error: {ex.Message}");
+            return false;
         }
-
-        // Start playback
-        SDL.SDL_PauseAudioDevice(_audioDevice, 0);
-        _initialized = true;
     }
 
     /// <summary>

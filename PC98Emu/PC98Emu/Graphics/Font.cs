@@ -11,6 +11,25 @@ public static class Font
     /// </summary>
     public static readonly byte[] AnkFont = GenerateAnkFont();
 
+    private static KanjiRom? _kanjiRom;
+
+    /// <summary>
+    /// Initialize kanji font rendering (call once at startup).
+    /// </summary>
+    public static void InitKanjiRom()
+    {
+        _kanjiRom = new KanjiRom();
+        if (_kanjiRom.Available)
+        {
+            // Regenerate extended ANK glyphs (half-width katakana) with real font
+            for (int ch = 0x80; ch <= 0xFF; ch++)
+            {
+                var glyph = _kanjiRom.GetAnkExtGlyph((byte)ch);
+                Array.Copy(glyph, 0, AnkFont, ch * 16, 16);
+            }
+        }
+    }
+
     /// <summary>
     /// Get glyph data for an ANK character (8x16, 16 bytes).
     /// </summary>
@@ -23,20 +42,21 @@ public static class Font
 
     /// <summary>
     /// Get glyph data for a JIS kanji character (16x16, 32 bytes).
-    /// Returns a placeholder pattern for now; ready for real kanji font integration.
+    /// Uses GDI-rendered glyphs from KanjiRom when available.
     /// </summary>
     public static byte[] GetKanjiGlyph(ushort jisCode)
     {
-        // Placeholder: filled rectangle with border
+        if (_kanjiRom != null && _kanjiRom.Available)
+            return _kanjiRom.GetKanjiGlyph(jisCode);
+
+        // Fallback: placeholder rectangle
         var glyph = new byte[32];
-        // Top and bottom rows full
-        glyph[0] = 0xFF; glyph[1] = 0xFF;   // row 0
-        glyph[30] = 0xFF; glyph[31] = 0xFF;  // row 15
-        // Middle rows: border pattern
+        glyph[0] = 0xFF; glyph[1] = 0xFF;
+        glyph[30] = 0xFF; glyph[31] = 0xFF;
         for (int row = 1; row < 15; row++)
         {
-            glyph[row * 2] = 0x80;      // left byte: left edge pixel
-            glyph[row * 2 + 1] = 0x01;  // right byte: right edge pixel
+            glyph[row * 2] = 0x80;
+            glyph[row * 2 + 1] = 0x01;
         }
         return glyph;
     }

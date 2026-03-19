@@ -4,20 +4,26 @@ namespace PC98Emu.Graphics;
 
 /// <summary>
 /// Renders the PC-98 graphics VRAM (4 bitplanes) to an RGBA framebuffer.
-/// Each plane is 32000 bytes (640x400 pixels, 1 bit per pixel).
-/// Planes are combined to produce a 4-bit (16-color) digital palette index.
+/// PC-98 GVRAM layout (640x400, 16-color mode):
+///   Plane 0 (Blue):      0xA8000-0xAFFFF (32KB)
+///   Plane 1 (Red):       0xB0000-0xB7FFF (32KB)
+///   Plane 2 (Green):     0xB8000-0xBFFFF (32KB)
+///   Plane 3 (Intensity): 0xE0000-0xE7FFF (32KB)
+/// Each plane stores 1 bit per pixel, combined for 4-bit color index.
 /// </summary>
 public class GraphicsRenderer
 {
     private readonly byte[] _memory;
     private readonly SystemBus _bus;
 
-    /// <summary>
-    /// 4 graphics VRAM planes, each 32000 bytes (640x400 / 8).
-    /// </summary>
-    public readonly byte[][] Planes = new byte[4][];
-
     private const int PlaneSize = 32000; // 640 * 400 / 8
+
+    // PC-98 GVRAM plane base addresses
+    private const int Plane0Base = 0xA8000; // Blue
+    private const int Plane1Base = 0xB0000; // Red
+    private const int Plane2Base = 0xB8000; // Green
+    private const int Plane3Base = 0xE0000; // Intensity
+
     private const int GvramStart = 0xA8000;
     private const int GvramEnd = 0xBFFFF;
 
@@ -46,40 +52,11 @@ public class GraphicsRenderer
     {
         _memory = memory;
         _bus = bus;
-
-        for (int i = 0; i < 4; i++)
-            Planes[i] = new byte[PlaneSize];
-    }
-
-    /// <summary>
-    /// Read a byte from GVRAM at the given address, using the current write plane.
-    /// Called by SystemBus for CPU reads from 0xA8000-0xBFFFF.
-    /// </summary>
-    public byte ReadGvram(int address)
-    {
-        int offset = address - GvramStart;
-        if (offset < 0 || offset >= PlaneSize) return 0xFF;
-
-        int plane = _bus.GvramWritePlane & 0x03;
-        return Planes[plane][offset];
-    }
-
-    /// <summary>
-    /// Write a byte to GVRAM at the given address, using the current write plane.
-    /// Called by SystemBus for CPU writes to 0xA8000-0xBFFFF.
-    /// </summary>
-    public void WriteGvram(int address, byte value)
-    {
-        int offset = address - GvramStart;
-        if (offset < 0 || offset >= PlaneSize) return;
-
-        int plane = _bus.GvramWritePlane & 0x03;
-        Planes[plane][offset] = value;
     }
 
     /// <summary>
     /// Render all 4 graphics planes to the framebuffer.
-    /// Combines planes bit-by-bit to get a 4-bit palette index per pixel.
+    /// Reads directly from the flat memory array at the correct plane addresses.
     /// </summary>
     public void Render(uint[] framebuffer, int width, int height)
     {
@@ -87,10 +64,10 @@ public class GraphicsRenderer
 
         for (int byteIdx = 0; byteIdx < maxBytes; byteIdx++)
         {
-            byte p0 = Planes[0][byteIdx];
-            byte p1 = Planes[1][byteIdx];
-            byte p2 = Planes[2][byteIdx];
-            byte p3 = Planes[3][byteIdx];
+            byte p0 = _memory[Plane0Base + byteIdx]; // Blue
+            byte p1 = _memory[Plane1Base + byteIdx]; // Red
+            byte p2 = _memory[Plane2Base + byteIdx]; // Green
+            byte p3 = _memory[Plane3Base + byteIdx]; // Intensity
 
             for (int bit = 7; bit >= 0; bit--)
             {

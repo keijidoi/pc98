@@ -4,7 +4,7 @@ using PC98Emu.Bus;
 public class RTC : IDevice
 {
     private int _command;
-    private int _outputBit;
+    private int _outputBit = 0;
 
     public byte ReadByte(int port)
     {
