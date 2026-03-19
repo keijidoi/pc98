@@ -108,6 +108,14 @@ public class DosBios
                 _cpu.AL = 0x00; // No character available
                 break;
 
+            case 0x11: // Find First File (FCB)
+                FcbFindFirst();
+                break;
+
+            case 0x12: // Find Next File (FCB)
+                FcbFindNext();
+                break;
+
             case 0x0E: // Select Disk
                 SelectDisk();
                 break;
@@ -398,6 +406,7 @@ public class DosBios
     // Shift-JIS lead byte buffer for multi-byte character assembly
     private byte _sjisLeadByte;
     private bool _hasSjisLead;
+    private bool _bootMenuCleaned;
 
     private static bool IsSjisLeadByte(byte b)
         => (b >= 0x81 && b <= 0x9F) || (b >= 0xE0 && b <= 0xFC);
@@ -1146,6 +1155,102 @@ public class DosBios
         _cpu.AX = 0x02; // File not found
         _cpu.Flags.CF = true;
         Console.Error.WriteLine($"[DOS] FindFirst → not found");
+    }
+
+    // FCB directory search state
+    private List<byte[]>? _fcbDirEntries;
+    private int _fcbDirIndex;
+    private byte[] _fcbSearchPattern = new byte[11]; // 8.3 pattern with '?' wildcards
+
+    private void FcbFindFirst()
+    {
+        // DS:DX = unopened FCB (drive + 8.3 pattern)
+        var mem = _bus.GetMemoryDirect();
+        int fcbAddr = (_cpu.DS << 4) + _cpu.DX;
+
+        // Read search pattern from FCB (offset 1-11: 8+3 filename)
+        for (int i = 0; i < 11; i++)
+            _fcbSearchPattern[i] = mem[(fcbAddr + 1 + i) & 0xFFFFF];
+
+        string pat = "";
+        for (int i = 0; i < 11; i++) pat += (char)_fcbSearchPattern[i];
+        Console.Error.WriteLine($"[DOS] FCB FindFirst pattern='{pat}'");
+
+        // Load directory entries
+        if (_fat16 != null && _fat16.IsInitialized)
+            _fcbDirEntries = _fat16.GetRootDirEntries();
+        else
+            _fcbDirEntries = new List<byte[]>();
+
+        _fcbDirIndex = 0;
+        FcbFindNextMatch();
+    }
+
+    private void FcbFindNext()
+    {
+        if (_fcbDirEntries == null)
+        {
+            _cpu.AL = 0xFF; // No more files
+            return;
+        }
+        FcbFindNextMatch();
+    }
+
+    private void FcbFindNextMatch()
+    {
+        var mem = _bus.GetMemoryDirect();
+        while (_fcbDirEntries != null && _fcbDirIndex < _fcbDirEntries.Count)
+        {
+            byte[] entry = _fcbDirEntries[_fcbDirIndex++];
+            byte attr = entry[0x0B];
+
+            // Match 8.3 pattern (? matches any char)
+            bool match = true;
+            for (int i = 0; i < 11; i++)
+            {
+                if (_fcbSearchPattern[i] == (byte)'?') continue;
+                if (_fcbSearchPattern[i] != entry[i]) { match = false; break; }
+            }
+            if (!match) continue;
+
+            // Write result to DTA as an FCB directory entry (33 bytes)
+            int dtaAddr = (_dtaSeg << 4) + _dtaOff;
+            // Byte 0: drive number (1=A)
+            mem[(dtaAddr) & 0xFFFFF] = 0x01;
+            // Bytes 1-11: filename (8.3)
+            for (int i = 0; i < 11; i++)
+                mem[(dtaAddr + 1 + i) & 0xFFFFF] = entry[i];
+            // Byte 12: attribute
+            mem[(dtaAddr + 12) & 0xFFFFF] = attr;
+            // Bytes 13-21: reserved (zero)
+            for (int i = 13; i < 22; i++)
+                mem[(dtaAddr + i) & 0xFFFFF] = 0;
+            // Bytes 22-23: time
+            mem[(dtaAddr + 22) & 0xFFFFF] = entry[0x16];
+            mem[(dtaAddr + 23) & 0xFFFFF] = entry[0x17];
+            // Bytes 24-25: date
+            mem[(dtaAddr + 24) & 0xFFFFF] = entry[0x18];
+            mem[(dtaAddr + 25) & 0xFFFFF] = entry[0x19];
+            // Bytes 26-27: start cluster
+            mem[(dtaAddr + 26) & 0xFFFFF] = entry[0x1A];
+            mem[(dtaAddr + 27) & 0xFFFFF] = entry[0x1B];
+            // Bytes 28-31: file size
+            mem[(dtaAddr + 28) & 0xFFFFF] = entry[0x1C];
+            mem[(dtaAddr + 29) & 0xFFFFF] = entry[0x1D];
+            mem[(dtaAddr + 30) & 0xFFFFF] = entry[0x1E];
+            mem[(dtaAddr + 31) & 0xFFFFF] = entry[0x1F];
+
+            string name = "";
+            for (int i = 0; i < 11; i++) name += (char)entry[i];
+            uint size = (uint)(entry[0x1C] | (entry[0x1D] << 8) | (entry[0x1E] << 16) | (entry[0x1F] << 24));
+            Console.Error.WriteLine($"[DOS] FCB FindMatch → '{name.Trim()}' attr={attr:X2} size={size}");
+
+            _cpu.AL = 0x00; // Found
+            return;
+        }
+
+        _cpu.AL = 0xFF; // No more files
+        Console.Error.WriteLine("[DOS] FCB FindMatch → no more files");
     }
 
     // File data cache for open file handles (loaded via FAT16)

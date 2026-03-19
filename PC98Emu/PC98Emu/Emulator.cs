@@ -299,6 +299,7 @@ public class Emulator
         bool partitionOffsetSet = false;
         bool dosPatched = false; // One-shot: patch DOS kernel before first user program runs
         bool dosLoopPatched = false; // One-shot: DOSINIT2 keyboard wait loop patched
+        bool bootMenuVramDirty = true; // Suppress rendering until boot menu cleanup is done
         int hltSkipCount = 0;
         int traceBuildBPB = 0; // trace next N instructions after buildBPB entry
         int buildBPBCount = 0; // count buildBPB entries to skip redundant SYSINIT calls
@@ -1210,6 +1211,27 @@ public class Emulator
                         kmem[patchBase + 0xD831] = 0x90; // NOP (was FF)
                         kmem[patchBase + 0xD832] = 0x90; // NOP (was FE)
                         Console.Error.WriteLine("[BOOTMENU] Patched: D830 JMP D732 → NOP (exit boot menu loop)");
+
+                        // Clean VRAM and enable rendering
+                        for (int pos = 0; pos < 80 * 25; pos++)
+                        {
+                            int a = 0xA0000 + pos * 2;
+                            int aa = 0xA2000 + pos * 2;
+                            ushort code = (ushort)(kmem[a] | (kmem[a + 1] << 8));
+                            if (code >= 0x100)
+                            {
+                                kmem[a] = 0x20;
+                                kmem[a + 1] = 0x00;
+                                kmem[aa] = 0x00;
+                                kmem[aa + 1] = 0x00;
+                            }
+                            else if (code <= 0x20)
+                            {
+                                kmem[aa] = 0x00;
+                                kmem[aa + 1] = 0x00;
+                            }
+                        }
+                        bootMenuVramDirty = false;
                     }
                 }
 
@@ -2029,8 +2051,12 @@ public class Emulator
 
                 if (hasDisplay)
                 {
-                    _display!.RenderFrame();
-                    quit = !_display.PollEvents();
+                    // Suppress rendering until boot menu cleanup is done
+                    if (!bootMenuVramDirty)
+                    {
+                        _display!.RenderFrame();
+                    }
+                    quit = !_display!.PollEvents();
                 }
 
                 if (hasAudio)
