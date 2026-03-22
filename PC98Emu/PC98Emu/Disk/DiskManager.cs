@@ -26,4 +26,10 @@ public class DiskManager
     {
         return (drive >= 0 && drive < _hdds.Length) ? _hdds[drive] : null;
     }
+
+    public void UnmountHDD(int drive)
+    {
+        if (drive >= 0 && drive < _hdds.Length)
+            _hdds[drive] = null;
+    }
 }

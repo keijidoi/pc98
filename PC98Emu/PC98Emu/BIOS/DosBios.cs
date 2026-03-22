@@ -24,8 +24,8 @@ public class DosBios
     private byte _verifyFlag;
     private ushort _lastError; // Last DOS error code for AH=59
 
-    // Simple file handle table (handles 0-19)
-    private const int MAX_HANDLES = 20;
+    // Simple file handle table (handles 0-39, extended for overlay managers)
+    private const int MAX_HANDLES = 40;
     private readonly bool[] _handleOpen = new bool[MAX_HANDLES];
 
     // File position and size tracking per handle
@@ -33,7 +33,7 @@ public class DosBios
     private readonly uint[] _fileSize = new uint[MAX_HANDLES];
 
     // Memory management - block allocator with free list
-    private const ushort MEM_TOP_SEG = 0x9A00; // Below video RAM; keeps COMMAND.COM data below 0xA0000 VRAM
+    private const ushort MEM_TOP_SEG = 0xA000; // PC-98 conventional memory top (640KB = 0xA0000)
     private readonly List<(ushort seg, ushort size)> _allocBlocks = new();
     private ushort _memBaseSeg = 0x3000; // Lowest allocation segment
 
@@ -41,12 +41,29 @@ public class DosBios
     private const byte DOS_MAJOR = 6;
     private const byte DOS_MINOR = 20;
 
-    private Fat16Reader? _fat16;
+    // Per-drive FAT16 readers (indexed by drive number: 0=A, 1=B, 2=C...)
+    private readonly Fat16Reader?[] _fatReaders = new Fat16Reader?[26];
+
+    // Fake SFT (System File Table) for overlay manager support
+    // SFT is stored in memory at a fixed address so overlay managers can directly access it
+    // Each SFT entry is 59 bytes (0x3B)
+    private const int SFT_BASE = 0xE7000; // In BIOS ROM area (below E8000)
+    private const int SFT_ENTRY_SIZE = 0x3B; // 59 bytes per entry
+    private const int SFT_HEADER_SIZE = 6; // 4-byte next pointer + 2-byte count
+
+    // Per-drive current directory (indexed by drive number, without leading/trailing backslash)
+    private readonly string[] _currentDirs = new string[26];
+
+    // Debug counter for AH=52 calls
+    private int _ah52CallCount = 0;
 
     public DosBios(V30 cpu, SystemBus bus)
     {
         _cpu = cpu;
         _bus = bus;
+
+        // Initialize fake SFT in memory
+        InitializeSft();
 
         // Pre-open standard handles
         _handleOpen[0] = true; // STDIN
@@ -58,7 +75,60 @@ public class DosBios
 
     public void SetFat16Reader(Fat16Reader reader)
     {
-        _fat16 = reader;
+        // Legacy: set for drive A (0)
+        _fatReaders[0] = reader;
+    }
+
+    public void SetCurrentDrive(byte drive)
+    {
+        _currentDrive = drive;
+    }
+
+    public void SetCurrentDirectory(byte drive, string dir)
+    {
+        if (drive < 26)
+            _currentDirs[drive] = dir;
+    }
+
+    public void SetFat16ReaderForDrive(int drive, Fat16Reader reader)
+    {
+        if (drive >= 0 && drive < _fatReaders.Length)
+            _fatReaders[drive] = reader;
+    }
+
+    /// <summary>
+    /// Get the Fat16Reader for the current drive, or null if none.
+    /// </summary>
+    private Fat16Reader? GetCurrentFat16()
+    {
+        return _fatReaders[_currentDrive];
+    }
+
+    /// <summary>
+    /// Reset all internal state for reboot.
+    /// </summary>
+    public void Reset()
+    {
+        _currentPSP = 0;
+        _dtaSeg = 0;
+        _dtaOff = 0x0080;
+        _currentDrive = 0;
+        _verifyFlag = 0;
+        _lastError = 0;
+        Array.Clear(_fatReaders);
+        _memBaseSeg = 0x3000;
+        _allocBlocks.Clear();
+        SkipIret = false;
+        TraceAfterExec = false;
+        WaitingForInput = false;
+        Array.Clear(_handleOpen);
+        Array.Clear(_filePosition);
+        Array.Clear(_fileSize);
+        _handleOpen[0] = true; // STDIN
+        _handleOpen[1] = true; // STDOUT
+        _handleOpen[2] = true; // STDERR
+        _handleOpen[3] = true; // STDAUX
+        _handleOpen[4] = true; // STDPRN
     }
 
     public void SetPSP(ushort segment)
@@ -72,6 +142,19 @@ public class DosBios
         if (memBase > _memBaseSeg)
             _memBaseSeg = memBase;
         Console.Error.WriteLine($"[DOS] SetPSP segment={segment:X4}, memBase={_memBaseSeg:X4}");
+    }
+
+    /// <summary>
+    /// Set current PSP segment (for direct game load, bypassing EXEC).
+    /// Also resets DTA and rebuilds MCB chain.
+    /// </summary>
+    public void SetCurrentPSP(ushort segment)
+    {
+        _currentPSP = segment;
+        _dtaSeg = segment;
+        _dtaOff = 0x0080;
+        Console.Error.WriteLine($"[DOS] SetCurrentPSP → {segment:X4}");
+        RebuildMcbChain();
     }
 
     /// <summary>
@@ -195,8 +278,7 @@ public class DosBios
                 break;
 
             case 0x3B: // Change Directory
-                // Stub: just succeed
-                _cpu.Flags.CF = false;
+                ChangeDirectory();
                 break;
 
             case 0x3C: // Create File
@@ -292,11 +374,129 @@ public class DosBios
                 break;
 
             case 0x52: // Get List of Lists (SYSVARS)
-                // Return pointer to a minimal structure
-                // Games check this for drive table pointer
-                _cpu.ES = 0x0060;
-                _cpu.BX = 0x0026; // Fake SYSVARS pointer
+            {
+                // Return pointer to a minimal SYSVARS structure in a safe area
+                // SYSVARS is at ES:BX where BX must be >= 2 (game reads ES:[BX-2] for MCB pointer)
+                // Use segment 0xE6F0, offset 0x26 (like real DOS), so SYSVARS at phys 0xE6F26
+                const ushort SYSVARS_SEG = 0xE6F0;
+                const ushort SYSVARS_OFF = 0x0026;
+                const int SYSVARS_ADDR = (SYSVARS_SEG << 4) + SYSVARS_OFF; // 0xE6F26
+                _cpu.ES = SYSVARS_SEG;
+                _cpu.BX = SYSVARS_OFF;
+
+                var sysMem = _bus.GetMemoryDirect();
+
+                // Dump calling code on first few calls for debugging
+                if (_ah52CallCount < 3)
+                {
+                    // Read return address from stack (IP is after INT 21h)
+                    int spAddr = (_cpu.SS << 4) + _cpu.SP;
+                    ushort retIP = (ushort)(sysMem[spAddr] | (sysMem[spAddr + 1] << 8));
+                    ushort retCS = (ushort)(sysMem[spAddr + 2] | (sysMem[spAddr + 3] << 8));
+                    int codeAddr = (retCS << 4) + retIP;
+                    string hex = "";
+                    for (int hh = 0; hh < 40 && codeAddr + hh < sysMem.Length; hh++)
+                        hex += $"{sysMem[codeAddr + hh]:X2} ";
+                    Console.Error.WriteLine($"[AH52-DBG] Call#{_ah52CallCount} ret={retCS:X4}:{retIP:X4} code: {hex}");
+                    // Also dump the stack
+                    string stackHex = "";
+                    for (int ss = 0; ss < 16 && spAddr + ss < sysMem.Length; ss++)
+                        stackHex += $"{sysMem[spAddr + ss]:X2} ";
+                    Console.Error.WriteLine($"[AH52-DBG] SS:SP={_cpu.SS:X4}:{_cpu.SP:X4} stack: {stackHex}");
+                    // Dump PSP JFT
+                    int pspA = _currentPSP << 4;
+                    string jftHex = "";
+                    for (int jj = 0; jj < 20; jj++)
+                        jftHex += $"{sysMem[pspA + 0x18 + jj]:X2} ";
+                    Console.Error.WriteLine($"[AH52-DBG] PSP={_currentPSP:X4} JFT: {jftHex}");
+                    Console.Error.WriteLine($"[AH52-DBG] PSP maxH={sysMem[pspA+0x32]|sysMem[pspA+0x33]<<8} JFTptr={sysMem[pspA+0x36]|sysMem[pspA+0x37]<<8:X4}:{sysMem[pspA+0x34]|sysMem[pspA+0x35]<<8:X4}");
+                }
+                _ah52CallCount++;
+
+                // Initialize SYSVARS structure (only on first call or if needed)
+                // Offset -2: first MCB segment
+                sysMem[SYSVARS_ADDR - 2] = (byte)(_memBaseSeg & 0xFF);
+                sysMem[SYSVARS_ADDR - 1] = (byte)(_memBaseSeg >> 8);
+                // Offset +0: first DPB pointer (FFFF:FFFF = no DPBs)
+                sysMem[SYSVARS_ADDR + 0] = 0xFF;
+                sysMem[SYSVARS_ADDR + 1] = 0xFF;
+                sysMem[SYSVARS_ADDR + 2] = 0xFF;
+                sysMem[SYSVARS_ADDR + 3] = 0xFF;
+                // Offset +4: SFT pointer
+                ushort sftOff = (ushort)(SFT_BASE & 0x0F);
+                ushort sftSeg = (ushort)(SFT_BASE >> 4);
+                sysMem[SYSVARS_ADDR + 4] = (byte)(sftOff & 0xFF);
+                sysMem[SYSVARS_ADDR + 5] = (byte)(sftOff >> 8);
+                sysMem[SYSVARS_ADDR + 6] = (byte)(sftSeg & 0xFF);
+                sysMem[SYSVARS_ADDR + 7] = (byte)(sftSeg >> 8);
+                // Offset +8: CLOCK$ device pointer (FFFF:FFFF)
+                sysMem[SYSVARS_ADDR + 8] = 0xFF;
+                sysMem[SYSVARS_ADDR + 9] = 0xFF;
+                sysMem[SYSVARS_ADDR + 10] = 0xFF;
+                sysMem[SYSVARS_ADDR + 11] = 0xFF;
+                // Offset +0C: CON device pointer (FFFF:FFFF)
+                sysMem[SYSVARS_ADDR + 0x0C] = 0xFF;
+                sysMem[SYSVARS_ADDR + 0x0D] = 0xFF;
+                sysMem[SYSVARS_ADDR + 0x0E] = 0xFF;
+                sysMem[SYSVARS_ADDR + 0x0F] = 0xFF;
+                // Offset +10: max sector size
+                sysMem[SYSVARS_ADDR + 0x10] = 0x00;
+                sysMem[SYSVARS_ADDR + 0x11] = 0x02; // 512 bytes
+                // Offset +12: disk buffer pointer (FFFF:FFFF)
+                sysMem[SYSVARS_ADDR + 0x12] = 0xFF;
+                sysMem[SYSVARS_ADDR + 0x13] = 0xFF;
+                sysMem[SYSVARS_ADDR + 0x14] = 0xFF;
+                sysMem[SYSVARS_ADDR + 0x15] = 0xFF;
+                // Offset +16: CDS array pointer (FFFF:FFFF)
+                sysMem[SYSVARS_ADDR + 0x16] = 0xFF;
+                sysMem[SYSVARS_ADDR + 0x17] = 0xFF;
+                sysMem[SYSVARS_ADDR + 0x18] = 0xFF;
+                sysMem[SYSVARS_ADDR + 0x19] = 0xFF;
+                // Offset +1A: FCB SFT pointer (same as SFT)
+                sysMem[SYSVARS_ADDR + 0x1A] = (byte)(sftOff & 0xFF);
+                sysMem[SYSVARS_ADDR + 0x1B] = (byte)(sftOff >> 8);
+                sysMem[SYSVARS_ADDR + 0x1C] = (byte)(sftSeg & 0xFF);
+                sysMem[SYSVARS_ADDR + 0x1D] = (byte)(sftSeg >> 8);
+                // Offset +1E: FCB table entries count
+                sysMem[SYSVARS_ADDR + 0x1E] = 0x04;
+                sysMem[SYSVARS_ADDR + 0x1F] = 0x00;
+                // Offset +20: number of block devices
+                sysMem[SYSVARS_ADDR + 0x20] = 0x02; // A: and B:
+                // Offset +21: LASTDRIVE value
+                sysMem[SYSVARS_ADDR + 0x21] = 0x1A; // 26 (Z:)
+                // Offset +22: NUL device header (18 bytes)
+                // next pointer = FFFF:FFFF
+                sysMem[SYSVARS_ADDR + 0x22] = 0xFF;
+                sysMem[SYSVARS_ADDR + 0x23] = 0xFF;
+                sysMem[SYSVARS_ADDR + 0x24] = 0xFF;
+                sysMem[SYSVARS_ADDR + 0x25] = 0xFF;
+                // attributes = 0x8004 (character device, NUL)
+                sysMem[SYSVARS_ADDR + 0x26] = 0x04;
+                sysMem[SYSVARS_ADDR + 0x27] = 0x80;
+                // strategy entry / interrupt entry (dummy)
+                sysMem[SYSVARS_ADDR + 0x28] = 0x00;
+                sysMem[SYSVARS_ADDR + 0x29] = 0x00;
+                sysMem[SYSVARS_ADDR + 0x2A] = 0x00;
+                sysMem[SYSVARS_ADDR + 0x2B] = 0x00;
+                // device name "NUL     "
+                sysMem[SYSVARS_ADDR + 0x2C] = (byte)'N';
+                sysMem[SYSVARS_ADDR + 0x2D] = (byte)'U';
+                sysMem[SYSVARS_ADDR + 0x2E] = (byte)'L';
+                sysMem[SYSVARS_ADDR + 0x2F] = (byte)' ';
+                sysMem[SYSVARS_ADDR + 0x30] = (byte)' ';
+                sysMem[SYSVARS_ADDR + 0x31] = (byte)' ';
+                sysMem[SYSVARS_ADDR + 0x32] = (byte)' ';
+                sysMem[SYSVARS_ADDR + 0x33] = (byte)' ';
+
+                // Ensure SFT header's "next" pointer is 0xFFFF:FFFF (end of chain)
+                sysMem[SFT_BASE] = 0xFF;
+                sysMem[SFT_BASE + 1] = 0xFF;
+                sysMem[SFT_BASE + 2] = 0xFF;
+                sysMem[SFT_BASE + 3] = 0xFF;
+                sysMem[SFT_BASE + 4] = (byte)(MAX_HANDLES & 0xFF);
+                sysMem[SFT_BASE + 5] = (byte)(MAX_HANDLES >> 8);
                 break;
+            }
 
             case 0x56: // Rename File
                 _cpu.Flags.CF = false; // Stub: succeed
@@ -434,6 +634,47 @@ public class DosBios
                 _cpu.Flags.CF = true; // Not supported
                 _cpu.AX = 0x01; // Invalid function
                 break;
+
+            case 0x67: // Set Handle Count
+            {
+                ushort newCount = _cpu.BX;
+                var jftMem = _bus.GetMemoryDirect();
+                int pspAddr = _currentPSP << 4;
+                // Read current JFT pointer and size
+                ushort oldMax = (ushort)(jftMem[pspAddr + 0x32] | (jftMem[pspAddr + 0x33] << 8));
+                ushort jftOff = (ushort)(jftMem[pspAddr + 0x34] | (jftMem[pspAddr + 0x35] << 8));
+                ushort jftSeg = (ushort)(jftMem[pspAddr + 0x36] | (jftMem[pspAddr + 0x37] << 8));
+                int oldJftAddr = (jftSeg << 4) + jftOff;
+                if (newCount <= oldMax)
+                {
+                    // Just update the count
+                    jftMem[pspAddr + 0x32] = (byte)(newCount & 0xFF);
+                    jftMem[pspAddr + 0x33] = (byte)(newCount >> 8);
+                }
+                else
+                {
+                    // Allocate new JFT in memory (use area after SYSVARS)
+                    const int NEW_JFT_BASE = 0xE6E00;
+                    // Copy existing entries
+                    for (int j = 0; j < oldMax && j < newCount; j++)
+                        jftMem[NEW_JFT_BASE + j] = jftMem[oldJftAddr + j];
+                    // Fill new entries with 0xFF (unused)
+                    for (int j = oldMax; j < newCount; j++)
+                        jftMem[NEW_JFT_BASE + j] = 0xFF;
+                    // Update PSP: new JFT pointer and count
+                    ushort newJftSeg = (ushort)(NEW_JFT_BASE >> 4);
+                    ushort newJftOff = (ushort)(NEW_JFT_BASE & 0x0F);
+                    jftMem[pspAddr + 0x32] = (byte)(newCount & 0xFF);
+                    jftMem[pspAddr + 0x33] = (byte)(newCount >> 8);
+                    jftMem[pspAddr + 0x34] = (byte)(newJftOff & 0xFF);
+                    jftMem[pspAddr + 0x35] = (byte)(newJftOff >> 8);
+                    jftMem[pspAddr + 0x36] = (byte)(newJftSeg & 0xFF);
+                    jftMem[pspAddr + 0x37] = (byte)(newJftSeg >> 8);
+                    Console.Error.WriteLine($"[DOS] SetHandleCount {oldMax} → {newCount}, JFT at {newJftSeg:X4}:{newJftOff:X4}");
+                }
+                _cpu.Flags.CF = false;
+                break;
+            }
 
             default:
                 // Unimplemented function - log and return with CF=0
@@ -622,12 +863,15 @@ public class DosBios
                 _escParams = "";
                 return;
             }
+            // ESC* (reset), ESC) etc. - single-char escape sequences, just consume
             _escState = EscState.None;
-            // Fall through to normal display
+            return; // Swallow the character after ESC
         }
         else if (_escState == EscState.Csi)
         {
-            if (ch >= (byte)'0' && ch <= (byte)'9' || ch == (byte)';')
+            // Accept digits, semicolons, and intermediate chars (>, =, ?, !)
+            if (ch >= (byte)'0' && ch <= (byte)'9' || ch == (byte)';'
+                || ch == (byte)'>' || ch == (byte)'=' || ch == (byte)'?' || ch == (byte)'!')
             {
                 _escParams += (char)ch;
                 return;
@@ -1128,6 +1372,8 @@ public class DosBios
         int ivtAddr = vector * 4;
         _cpu.BX = _bus.ReadMemoryWord(ivtAddr);
         _cpu.ES = _bus.ReadMemoryWord(ivtAddr + 2);
+        if (vector == 0x41 || vector == 0x42 || (vector >= 0x60 && vector <= 0x70))
+            Console.Error.WriteLine($"[INT21-35] GetVector INT {vector:X2} → {_cpu.ES:X4}:{_cpu.BX:X4} from {_cpu.CS:X4}:{_cpu.IP:X4}");
     }
 
     private void GetDate()
@@ -1189,13 +1435,33 @@ public class DosBios
                 _fileData[i] = null;
 
                 // Try to load file from FAT16
-                if (_fat16 != null && _fat16.IsInitialized)
+                // Determine the drive from the filename, or use current drive
+                byte fileDrive = _currentDrive;
+                string lookupName = filename;
+                if (filename.Length >= 2 && filename[1] == ':')
                 {
-                    var (cluster, size) = _fat16.FindFile(filename);
+                    fileDrive = (byte)(char.ToUpper(filename[0]) - 'A');
+                    lookupName = filename.Substring(2);
+                }
+
+                // If the filename has no directory component, prepend current directory
+                if (!lookupName.Contains('\\') && !lookupName.Contains('/'))
+                {
+                    string curDir = _currentDirs[fileDrive] ?? "";
+                    if (curDir.Length > 0)
+                        lookupName = curDir + "\\" + lookupName;
+                }
+
+                var fat16 = _fatReaders[fileDrive];
+                if (fat16 != null && fat16.IsInitialized)
+                {
+                    var (cluster, size) = fat16.FindFile(lookupName);
+                    if (cluster == 0)
+                        Console.Error.WriteLine($"[DOS] OpenFile '{filename}' resolved to '{lookupName}' on drive {fileDrive}");
                     if (cluster != 0)
                     {
                         _fileSize[i] = size;
-                        _fileData[i] = _fat16.ReadFile(cluster, size);
+                        _fileData[i] = fat16.ReadFile(cluster, size);
                         Console.Error.WriteLine($"[DOS] OpenFile '{filename}' → handle {i}, size={size}, loaded={_fileData[i] != null}");
                     }
                     else
@@ -1211,6 +1477,8 @@ public class DosBios
 
                 _cpu.AX = (ushort)i;
                 _cpu.Flags.CF = false;
+                UpdateSftEntry(i);
+                UpdateJft(i, (byte)i); // Map handle to SFT index
                 return;
             }
         }
@@ -1229,6 +1497,8 @@ public class DosBios
             _filePosition[handle] = 0;
             _fileSize[handle] = 0;
             _cpu.Flags.CF = false;
+            UpdateSftEntry(handle);
+            UpdateJft(handle, 0xFF); // Mark JFT entry as unused
         }
         else
         {
@@ -1260,6 +1530,9 @@ public class DosBios
             return;
         }
 
+        // Sync position from SFT (overlay manager may have changed it directly)
+        SyncFromSft(handle);
+
         // Read from cached file data
         byte[]? data = _fileData[handle];
         if (data == null)
@@ -1279,6 +1552,7 @@ public class DosBios
         _filePosition[handle] = pos + (uint)bytesRead;
         _cpu.AX = (ushort)bytesRead;
         _cpu.Flags.CF = false;
+        UpdateSftEntry(handle);
     }
 
     private void WriteFile()
@@ -1358,7 +1632,10 @@ public class DosBios
         }
 
         if (handle < MAX_HANDLES)
+        {
             _filePosition[handle] = newPos;
+            UpdateSftEntry(handle);
+        }
 
         Console.Error.WriteLine($"[DOS] LSEEK handle={handle} method={method} offset={offset} size={size} → pos={newPos}");
 
@@ -1398,14 +1675,162 @@ public class DosBios
         }
     }
 
+    private void ChangeDirectory()
+    {
+        // DS:DX = ASCIZ path
+        int nameAddr = (_cpu.DS << 4) + _cpu.DX;
+        var mem = _bus.GetMemoryDirect();
+        string path = "";
+        for (int i = 0; i < 128; i++)
+        {
+            byte ch = mem[(nameAddr + i) & 0xFFFFF];
+            if (ch == 0) break;
+            path += (char)ch;
+        }
+
+        // Determine which drive
+        byte drive = _currentDrive;
+        if (path.Length >= 2 && path[1] == ':')
+        {
+            drive = (byte)(char.ToUpper(path[0]) - 'A');
+            path = path.Substring(2);
+        }
+
+        // Normalize
+        path = path.Replace('/', '\\').Trim('\\');
+
+        // Handle special cases
+        if (path == "." || path == "")
+        {
+            // Stay in current dir (or go to root if empty after stripping)
+            if (path == "") _currentDirs[drive] = "";
+        }
+        else if (path == "..")
+        {
+            // Go up one level
+            string cur = _currentDirs[drive] ?? "";
+            int lastSep = cur.LastIndexOf('\\');
+            _currentDirs[drive] = lastSep >= 0 ? cur.Substring(0, lastSep) : "";
+        }
+        else if (path.StartsWith("\\"))
+        {
+            // Absolute path
+            _currentDirs[drive] = path.TrimStart('\\');
+        }
+        else
+        {
+            // Could be absolute or relative — if starts from root, treat as absolute
+            _currentDirs[drive] = path;
+        }
+
+        Console.Error.WriteLine($"[DOS] ChDir drive={drive} path='{path}' → currentDir='{_currentDirs[drive]}'");
+        _cpu.Flags.CF = false;
+    }
+
     private void GetCurrentDirectory()
     {
+        // DL = drive (0=default, 1=A, 2=B, ...)
         // DS:SI = buffer for path (64 bytes, no drive letter, no leading backslash)
+        byte drive = _cpu.DL == 0 ? _currentDrive : (byte)(_cpu.DL - 1);
         int addr = (_cpu.DS << 4) + _cpu.SI;
         var mem = _bus.GetMemoryDirect();
-        // Return root directory (empty string)
-        mem[addr & 0xFFFFF] = 0x00;
+        string dir = _currentDirs[drive] ?? "";
+        for (int i = 0; i < dir.Length && i < 63; i++)
+            mem[(addr + i) & 0xFFFFF] = (byte)dir[i];
+        mem[(addr + dir.Length) & 0xFFFFF] = 0x00;
         _cpu.Flags.CF = false;
+    }
+
+    /// <summary>
+    /// Reset memory allocations and set up a single block for a directly loaded program.
+    /// Used when the emulator bypasses DOS EXEC to load a game.
+    /// </summary>
+    public void ResetAllocationsForDirectLoad(ushort pspSeg, ushort totalParagraphs)
+    {
+        _allocBlocks.Clear();
+        _memBaseSeg = (ushort)(pspSeg - 1); // MCB starts one paragraph before PSP
+        _allocBlocks.Add((pspSeg, totalParagraphs));
+        Console.Error.WriteLine($"[DOS] ResetAlloc: cleared all blocks, set {pspSeg:X4} size={totalParagraphs:X4} (end={pspSeg + totalParagraphs:X4})");
+        RebuildMcbChain();
+    }
+
+    /// <summary>
+    /// Rebuild the MCB (Memory Control Block) chain in memory from our allocation list.
+    /// MCB format: Byte 0 = 'M' or 'Z', Bytes 1-2 = owner PSP, Bytes 3-4 = size in paragraphs
+    /// Each MCB is 1 paragraph (16 bytes) before the allocated block.
+    /// </summary>
+    private void RebuildMcbChain()
+    {
+        var mem = _bus.GetMemoryDirect();
+
+        // Sort allocations by segment
+        var sorted = _allocBlocks.OrderBy(b => b.seg).ToList();
+        if (sorted.Count == 0) return;
+
+        // Build MCB chain
+        // First MCB is at _memBaseSeg (one paragraph before first allocated block)
+        for (int i = 0; i < sorted.Count; i++)
+        {
+            ushort blockSeg = sorted[i].seg;
+            ushort blockSize = sorted[i].size;
+            ushort mcbSeg = (ushort)(blockSeg - 1); // MCB is one paragraph before the block
+            int mcbAddr = mcbSeg << 4;
+
+            bool isLast = (i == sorted.Count - 1);
+
+            if (isLast)
+            {
+                // Last MCB: type='M' for the allocation, then a final 'Z' MCB for remaining free space
+                mem[mcbAddr] = (byte)'M';
+                mem[mcbAddr + 1] = (byte)(_currentPSP & 0xFF);
+                mem[mcbAddr + 2] = (byte)(_currentPSP >> 8);
+                mem[mcbAddr + 3] = (byte)(blockSize & 0xFF);
+                mem[mcbAddr + 4] = (byte)(blockSize >> 8);
+                // Clear rest of MCB
+                for (int j = 5; j < 16; j++) mem[mcbAddr + j] = 0;
+
+                // Add final free MCB at end of this block
+                ushort freeMcbSeg = (ushort)(blockSeg + blockSize);
+                if (freeMcbSeg < MEM_TOP_SEG)
+                {
+                    int freeAddr = freeMcbSeg << 4;
+                    ushort freeSize = (ushort)(MEM_TOP_SEG - freeMcbSeg - 1);
+                    mem[freeAddr] = (byte)'Z'; // Last MCB
+                    mem[freeAddr + 1] = 0x00; // Owner = 0 (free)
+                    mem[freeAddr + 2] = 0x00;
+                    mem[freeAddr + 3] = (byte)(freeSize & 0xFF);
+                    mem[freeAddr + 4] = (byte)(freeSize >> 8);
+                    for (int j = 5; j < 16; j++) mem[freeAddr + j] = 0;
+                }
+            }
+            else
+            {
+                // Middle MCB
+                ushort nextSeg = sorted[i + 1].seg;
+                mem[mcbAddr] = (byte)'M';
+                mem[mcbAddr + 1] = (byte)(_currentPSP & 0xFF);
+                mem[mcbAddr + 2] = (byte)(_currentPSP >> 8);
+                mem[mcbAddr + 3] = (byte)(blockSize & 0xFF);
+                mem[mcbAddr + 4] = (byte)(blockSize >> 8);
+                for (int j = 5; j < 16; j++) mem[mcbAddr + j] = 0;
+
+                // If there's a gap between this block and the next, add a free MCB
+                ushort gapSeg = (ushort)(blockSeg + blockSize);
+                if (gapSeg + 1 < nextSeg - 1) // Need room for gap MCB + at least 0 data paragraphs
+                {
+                    int gapAddr = gapSeg << 4;
+                    ushort gapSize = (ushort)(nextSeg - gapSeg - 2); // gap + 1 MCB para + gapSize = next MCB
+                    mem[gapAddr] = (byte)'M';
+                    mem[gapAddr + 1] = 0x00; // Free
+                    mem[gapAddr + 2] = 0x00;
+                    mem[gapAddr + 3] = (byte)(gapSize & 0xFF);
+                    mem[gapAddr + 4] = (byte)(gapSize >> 8);
+                    for (int j = 5; j < 16; j++) mem[gapAddr + j] = 0;
+                }
+            }
+        }
+
+        Console.Error.WriteLine($"[DOS] MCB chain rebuilt: {sorted.Count} blocks, base={_memBaseSeg:X4}");
     }
 
     private ushort GetNextFreeSeg()
@@ -1431,11 +1856,23 @@ public class DosBios
 
         if (paragraphs <= available)
         {
-            ushort segment = nextFree;
-            _allocBlocks.Add((segment, paragraphs));
-            _cpu.AX = segment;
-            _cpu.Flags.CF = false;
-            Console.Error.WriteLine($"[DOS] AllocMem → segment {segment:X4}");
+            ushort segment = (ushort)(nextFree + 1); // +1 for MCB paragraph
+            available = (ushort)(nextFree + 1 < MEM_TOP_SEG ? MEM_TOP_SEG - nextFree - 1 : 0);
+            if (paragraphs <= available)
+            {
+                _allocBlocks.Add((segment, paragraphs));
+                _cpu.AX = segment;
+                _cpu.Flags.CF = false;
+                Console.Error.WriteLine($"[DOS] AllocMem → segment {segment:X4}");
+                RebuildMcbChain();
+            }
+            else
+            {
+                _cpu.AX = 0x08;
+                _cpu.BX = available;
+                _cpu.Flags.CF = true;
+                Console.Error.WriteLine($"[DOS] AllocMem FAILED (MCB), max avail={available:X4} paragraphs");
+            }
         }
         else
         {
@@ -1454,6 +1891,7 @@ public class DosBios
         {
             Console.Error.WriteLine($"[DOS] FreeMem ES={segment:X4} size={_allocBlocks[idx].size:X4}");
             _allocBlocks.RemoveAt(idx);
+            RebuildMcbChain();
         }
         else
         {
@@ -1478,19 +1916,43 @@ public class DosBios
     {
         ushort segment = _cpu.ES;
         ushort newSize = _cpu.BX;
-        Console.Error.WriteLine($"[DOS] ResizeMem ES={segment:X4} BX={newSize:X4}");
 
         int idx = _allocBlocks.FindIndex(b => b.seg == segment);
-        if (idx >= 0)
+        if (idx < 0)
+        {
+            // Not tracked — add it as a new block with size 0
+            _allocBlocks.Add((segment, (ushort)0));
+            idx = _allocBlocks.Count - 1;
+        }
+
+        // Calculate maximum available size for this block:
+        // From segment to either the next allocated block or MEM_TOP_SEG
+        ushort currentSize = _allocBlocks[idx].size;
+        int blockEnd = segment + currentSize; // Current end of this block
+
+        // Find the lowest block that starts above this segment
+        int maxEnd = MEM_TOP_SEG;
+        foreach (var (bSeg, bSize) in _allocBlocks)
+        {
+            if (bSeg > segment && bSeg < maxEnd)
+                maxEnd = bSeg;
+        }
+        ushort maxAvail = (ushort)(maxEnd - segment);
+
+        if (newSize <= maxAvail)
         {
             _allocBlocks[idx] = (segment, newSize);
+            _cpu.Flags.CF = false;
+            Console.Error.WriteLine($"[DOS] ResizeMem ES={segment:X4} BX={newSize:X4} → OK (max={maxAvail:X4})");
+            RebuildMcbChain();
         }
         else
         {
-            // Not tracked — add it as a new block
-            _allocBlocks.Add((segment, newSize));
+            _cpu.AX = 0x08; // Insufficient memory
+            _cpu.BX = maxAvail;
+            _cpu.Flags.CF = true;
+            Console.Error.WriteLine($"[DOS] ResizeMem ES={segment:X4} BX={newSize:X4} → FAIL (max={maxAvail:X4})");
         }
-        _cpu.Flags.CF = false;
     }
 
     // Handle-based search state (AH=4E/4F)
@@ -1540,9 +2002,42 @@ public class DosBios
             for (int i = 0; i < 11; i++) _handleSearchPattern83[i] = (byte)'?';
         }
 
+        // Determine the drive and directory to search
+        byte searchDrive = _currentDrive;
+        string searchPath = filespec;
+        if (searchPath.Length >= 2 && searchPath[1] == ':')
+        {
+            searchDrive = (byte)(char.ToUpper(searchPath[0]) - 'A');
+            searchPath = searchPath.Substring(2);
+        }
+
+        // Extract directory portion from the filespec
+        int dirEnd = Math.Max(searchPath.LastIndexOf('\\'), searchPath.LastIndexOf('/'));
+        string searchDir = dirEnd >= 0 ? searchPath.Substring(0, dirEnd) : "";
+
+        // If no directory in filespec, use current directory for the drive
+        if (searchDir.Length == 0)
+            searchDir = _currentDirs[searchDrive] ?? "";
+
         // Load directory entries
-        if (_fat16 != null && _fat16.IsInitialized)
-            _handleDirEntries = _fat16.GetRootDirEntries();
+        var fat16 = _fatReaders[searchDrive];
+        if (fat16 != null && fat16.IsInitialized)
+        {
+            if (searchDir.Length > 0)
+            {
+                int dirCluster = fat16.ResolveDirPath(searchDir);
+                if (dirCluster > 0)
+                    _handleDirEntries = fat16.GetSubDirEntries((ushort)dirCluster);
+                else if (dirCluster == 0)
+                    _handleDirEntries = fat16.GetRootDirEntries();
+                else
+                    _handleDirEntries = new List<byte[]>(); // dir not found
+            }
+            else
+            {
+                _handleDirEntries = fat16.GetRootDirEntries();
+            }
+        }
         else
             _handleDirEntries = new List<byte[]>();
 
@@ -1668,8 +2163,9 @@ public class DosBios
         Console.Error.WriteLine($"[DOS] FCB FindFirst pattern='{pat}' attr={_fcbSearchAttr:X2} rawFCB=[{hexDump.Trim()}]");
 
         // Load directory entries
-        if (_fat16 != null && _fat16.IsInitialized)
-            _fcbDirEntries = _fat16.GetRootDirEntries();
+        var fat16 = GetCurrentFat16();
+        if (fat16 != null && fat16.IsInitialized)
+            _fcbDirEntries = fat16.GetRootDirEntries();
         else
             _fcbDirEntries = new List<byte[]>();
 
@@ -1749,6 +2245,131 @@ public class DosBios
     // File data cache for open file handles (loaded via FAT16)
     private readonly byte[]?[] _fileData = new byte[MAX_HANDLES][];
 
+    /// <summary>
+    /// Initialize the fake SFT (System File Table) in memory.
+    /// The SFT is a linked list of tables. We create one table with MAX_HANDLES entries.
+    /// </summary>
+    private void InitializeSft()
+    {
+        var mem = _bus.GetMemoryDirect();
+        int addr = SFT_BASE;
+
+        // SFT header: next pointer (FFFF:FFFF = end of chain), entry count
+        mem[addr] = 0xFF; mem[addr + 1] = 0xFF; // next offset = FFFF
+        mem[addr + 2] = 0xFF; mem[addr + 3] = 0xFF; // next segment = FFFF
+        mem[addr + 4] = (byte)(MAX_HANDLES & 0xFF);
+        mem[addr + 5] = (byte)(MAX_HANDLES >> 8);
+
+        // Initialize all entries as closed
+        for (int i = 0; i < MAX_HANDLES; i++)
+        {
+            int entryAddr = SFT_BASE + SFT_HEADER_SIZE + i * SFT_ENTRY_SIZE;
+            Array.Clear(mem, entryAddr, SFT_ENTRY_SIZE);
+        }
+    }
+
+    /// <summary>
+    /// Update the SFT entry for a given handle to match our internal state.
+    /// Called after Open, Close, Seek, Read operations.
+    /// </summary>
+    private void UpdateSftEntry(int handle)
+    {
+        if (handle < 0 || handle >= MAX_HANDLES) return;
+        var mem = _bus.GetMemoryDirect();
+        int addr = SFT_BASE + SFT_HEADER_SIZE + handle * SFT_ENTRY_SIZE;
+
+        if (_handleOpen[handle])
+        {
+            // Handle count (number of references)
+            mem[addr + 0] = 0x01; mem[addr + 1] = 0x00;
+            // Open mode
+            mem[addr + 2] = 0x02; // Read/Write
+            // Attribute
+            mem[addr + 3] = 0x20; // Archive
+            // Device info word (bit 6 = not EOF, bit 7 = 0 for file)
+            mem[addr + 4] = 0x40; mem[addr + 5] = 0x00;
+            // File size (32-bit LE)
+            uint size = _fileSize[handle];
+            mem[addr + 0x11] = (byte)(size & 0xFF);
+            mem[addr + 0x12] = (byte)((size >> 8) & 0xFF);
+            mem[addr + 0x13] = (byte)((size >> 16) & 0xFF);
+            mem[addr + 0x14] = (byte)((size >> 24) & 0xFF);
+            // File position (32-bit LE)
+            uint pos = _filePosition[handle];
+            mem[addr + 0x15] = (byte)(pos & 0xFF);
+            mem[addr + 0x16] = (byte)((pos >> 8) & 0xFF);
+            mem[addr + 0x17] = (byte)((pos >> 16) & 0xFF);
+            mem[addr + 0x18] = (byte)((pos >> 24) & 0xFF);
+        }
+        else
+        {
+            // Closed - zero out
+            mem[addr + 0] = 0x00; mem[addr + 1] = 0x00;
+        }
+    }
+
+    /// <summary>
+    /// Update the JFT (Job File Table) in the PSP for a given handle.
+    /// Maps handle number to SFT index (or 0xFF for closed).
+    /// </summary>
+    private void UpdateJft(int handle, byte sftIndex)
+    {
+        if (_currentPSP == 0) return;
+        var mem = _bus.GetMemoryDirect();
+        int pspAddr = _currentPSP << 4;
+        // Read JFT pointer from PSP
+        ushort jftOff = (ushort)(mem[pspAddr + 0x34] | (mem[pspAddr + 0x35] << 8));
+        ushort jftSeg = (ushort)(mem[pspAddr + 0x36] | (mem[pspAddr + 0x37] << 8));
+        ushort maxHandles = (ushort)(mem[pspAddr + 0x32] | (mem[pspAddr + 0x33] << 8));
+        if (handle < maxHandles)
+        {
+            int jftAddr = (jftSeg << 4) + jftOff + handle;
+            mem[jftAddr] = sftIndex;
+        }
+    }
+
+    /// <summary>
+    /// Sync file position from SFT entry back to our internal state.
+    /// Called before Read/Seek to pick up position changes made by overlay manager.
+    /// </summary>
+    private void SyncFromSft(int handle)
+    {
+        if (handle < 0 || handle >= MAX_HANDLES) return;
+        var mem = _bus.GetMemoryDirect();
+        int addr = SFT_BASE + SFT_HEADER_SIZE + handle * SFT_ENTRY_SIZE;
+
+        // Read file position back from SFT
+        uint pos = (uint)(mem[addr + 0x15] | (mem[addr + 0x16] << 8) |
+                         (mem[addr + 0x17] << 16) | (mem[addr + 0x18] << 24));
+        if (pos != _filePosition[handle] && _handleOpen[handle])
+        {
+            Console.Error.WriteLine($"[SFT] Handle {handle} pos synced: {_filePosition[handle]:X8} → {pos:X8}");
+            _filePosition[handle] = pos;
+        }
+    }
+
+    /// <summary>
+    /// Get SFT entry address for INT 2F AX=122E.
+    /// Returns the segment:offset of the SFT entry for the given handle index.
+    /// </summary>
+    public (ushort seg, ushort off) GetSftEntryAddress(int handleIndex)
+    {
+        int addr = SFT_BASE + SFT_HEADER_SIZE + handleIndex * SFT_ENTRY_SIZE;
+        ushort seg = (ushort)(addr >> 4);
+        ushort off = (ushort)(addr & 0x0F);
+        return (seg, off);
+    }
+
+    /// <summary>
+    /// Get SFT header address (for INT 21h AH=52 - Get List of Lists).
+    /// </summary>
+    public (ushort seg, ushort off) GetSftHeaderAddress()
+    {
+        ushort seg = (ushort)(SFT_BASE >> 4);
+        ushort off = (ushort)(SFT_BASE & 0x0F);
+        return (seg, off);
+    }
+
     private void Exec()
     {
         // INT 21h AH=4Bh: EXEC
@@ -1767,6 +2388,7 @@ public class DosBios
         }
         Console.Error.WriteLine($"[DOS] EXEC filename: {filename}");
 
+        var _fat16 = GetCurrentFat16();
         if (_fat16 == null || !_fat16.IsInitialized)
         {
             Console.Error.WriteLine("[DOS] EXEC failed: no filesystem");
@@ -1775,19 +2397,35 @@ public class DosBios
             return;
         }
 
+        // Resolve drive and current directory (same logic as OpenFile)
+        byte fileDrive = _currentDrive;
+        string lookupName = filename;
+        if (filename.Length >= 2 && filename[1] == ':')
+        {
+            fileDrive = (byte)(char.ToUpper(filename[0]) - 'A');
+            lookupName = filename.Substring(2);
+        }
+        if (!lookupName.Contains('\\') && !lookupName.Contains('/'))
+        {
+            string curDir = _currentDirs[fileDrive] ?? "";
+            if (curDir.Length > 0)
+                lookupName = curDir + "\\" + lookupName;
+        }
+        var fileFat = _fatReaders[fileDrive] ?? _fat16;
+        Console.Error.WriteLine($"[DOS] EXEC resolved: '{lookupName}' on drive {fileDrive}");
+
         // Find file on disk
-        var (cluster, fileSize) = _fat16.FindFile(filename);
+        var (cluster, fileSize) = fileFat.FindFile(lookupName);
         if (cluster == 0)
         {
-            Console.Error.WriteLine($"[DOS] EXEC '{filename}' not found");
-            _fat16.ListRootDir();
+            Console.Error.WriteLine($"[DOS] EXEC '{filename}' → '{lookupName}' not found");
             _cpu.AX = 0x02;
             _cpu.Flags.CF = true;
             return;
         }
 
         // Read file data
-        byte[]? fileData = _fat16.ReadFile(cluster, fileSize);
+        byte[]? fileData = fileFat.ReadFile(cluster, fileSize);
         if (fileData == null)
         {
             Console.Error.WriteLine($"[DOS] EXEC '{filename}' read error");
@@ -1798,16 +2436,81 @@ public class DosBios
 
         Console.Error.WriteLine($"[DOS] EXEC loaded {fileData.Length} bytes from disk");
 
+        if (subfunc == 0x03)
+        {
+            // AL=03: Load Overlay - load EXE code at ES:BX-specified segment, no PSP
+            LoadOverlay(fileData);
+            return;
+        }
+
         // Check for EXE or COM
         bool isExe = fileData.Length >= 2 && fileData[0] == 0x4D && fileData[1] == 0x5A;
 
         // Allocate memory for the program
-        ushort loadSeg = GetNextFreeSeg();
+        ushort loadSeg = (ushort)(GetNextFreeSeg() + 1); // +1 for MCB
 
         if (isExe)
             LoadExe(fileData, loadSeg, subfunc);
         else
             LoadCom(fileData, loadSeg, subfunc);
+    }
+
+    /// <summary>
+    /// Load Overlay (AH=4B AL=03): Load EXE code at specified segment without creating PSP.
+    /// Parameter block at ES:BX: [+0]=load segment, [+2]=relocation factor
+    /// </summary>
+    private void LoadOverlay(byte[] data)
+    {
+        var mem = _bus.GetMemoryDirect();
+        int paramAddr = (_cpu.ES << 4) + _cpu.BX;
+        ushort loadSeg = (ushort)(mem[paramAddr] | (mem[paramAddr + 1] << 8));
+        ushort relocFactor = (ushort)(mem[paramAddr + 2] | (mem[paramAddr + 3] << 8));
+
+        Console.Error.WriteLine($"[DOS] EXEC Overlay: loadSeg={loadSeg:X4} relocFactor={relocFactor:X4} size={data.Length}");
+
+        bool isExe = data.Length >= 2 && data[0] == 0x4D && data[1] == 0x5A;
+        if (isExe)
+        {
+            // Parse EXE header
+            int headerSize = (data[8] | (data[9] << 8)) * 16;
+            int relocCount = data[6] | (data[7] << 8);
+            int relocOff = data[0x18] | (data[0x19] << 8);
+            int codeLen = data.Length - headerSize;
+
+            // Copy code to load segment
+            int loadAddr = loadSeg << 4;
+            if (loadAddr + codeLen <= mem.Length)
+                Array.Copy(data, headerSize, mem, loadAddr, codeLen);
+
+            // Apply relocations using relocFactor
+            for (int r = 0; r < relocCount; r++)
+            {
+                int rOff = relocOff + r * 4;
+                if (rOff + 3 >= data.Length) break;
+                int rOffset = data[rOff] | (data[rOff + 1] << 8);
+                int rSeg = data[rOff + 2] | (data[rOff + 3] << 8);
+                int fixAddr = loadAddr + rSeg * 16 + rOffset;
+                if (fixAddr + 1 < mem.Length)
+                {
+                    ushort val = (ushort)(mem[fixAddr] | (mem[fixAddr + 1] << 8));
+                    val += relocFactor;
+                    mem[fixAddr] = (byte)(val & 0xFF);
+                    mem[fixAddr + 1] = (byte)(val >> 8);
+                }
+            }
+
+            Console.Error.WriteLine($"[DOS] EXEC Overlay loaded: {codeLen} bytes at {loadSeg:X4}, {relocCount} relocs (factor={relocFactor:X4})");
+        }
+        else
+        {
+            // COM-style overlay: just copy data to load segment
+            int loadAddr = loadSeg << 4;
+            if (loadAddr + data.Length <= mem.Length)
+                Array.Copy(data, 0, mem, loadAddr, data.Length);
+            Console.Error.WriteLine($"[DOS] EXEC Overlay (COM) loaded: {data.Length} bytes at {loadSeg:X4}");
+        }
+
+        _cpu.Flags.CF = false;
     }
 
     private void LoadCom(byte[] data, ushort loadSeg, byte subfunc)

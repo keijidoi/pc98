@@ -12,26 +12,36 @@ public class Display : IDisposable
 {
     private readonly TextRenderer _textRenderer;
     private readonly GraphicsRenderer _graphicsRenderer;
+    private readonly GDC _textGdc;
     private readonly int _scale;
 
     private const int ScreenWidth = 640;
     private const int ScreenHeight = 400;
+    private readonly int _totalHeight; // ScreenHeight + MenuBarHeight
 
     private IntPtr _window;
     private IntPtr _renderer;
-    private IntPtr _texture;
+    private IntPtr _texture; // Full window texture (menu bar + screen)
 
     private readonly uint[] _textBuffer = new uint[ScreenWidth * ScreenHeight];
     private readonly uint[] _graphicsBuffer = new uint[ScreenWidth * ScreenHeight];
-    private readonly uint[] _compositeBuffer = new uint[ScreenWidth * ScreenHeight];
+    private readonly uint[] _compositeBuffer; // menu bar + screen combined
+
+    private readonly MenuBar _menuBar;
 
     private bool _disposed;
 
-    public Display(TextRenderer textRenderer, GraphicsRenderer graphicsRenderer, int scale = 2)
+    public MenuBar MenuBar => _menuBar;
+
+    public Display(TextRenderer textRenderer, GraphicsRenderer graphicsRenderer, GDC textGdc, int scale = 2)
     {
         _textRenderer = textRenderer;
         _graphicsRenderer = graphicsRenderer;
+        _textGdc = textGdc;
         _scale = scale;
+        _menuBar = new MenuBar();
+        _totalHeight = MenuBar.MenuBarHeight + ScreenHeight;
+        _compositeBuffer = new uint[ScreenWidth * _totalHeight];
     }
 
     /// <summary>
@@ -45,7 +55,7 @@ public class Display : IDisposable
         _window = SDL_CreateWindow(
             "PC-98 Emulator",
             SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-            ScreenWidth * _scale, ScreenHeight * _scale,
+            ScreenWidth * _scale, _totalHeight * _scale,
             SDL_WindowFlags.SDL_WINDOW_SHOWN);
 
         if (_window == IntPtr.Zero)
@@ -61,33 +71,55 @@ public class Display : IDisposable
             _renderer,
             SDL_PIXELFORMAT_ARGB8888,
             (int)SDL_TextureAccess.SDL_TEXTUREACCESS_STREAMING,
-            ScreenWidth, ScreenHeight);
+            ScreenWidth, _totalHeight);
 
         if (_texture == IntPtr.Zero)
             throw new InvalidOperationException($"SDL_CreateTexture failed: {SDL_GetError()}");
     }
 
     /// <summary>
-    /// Render one frame: text layer on top of graphics layer.
+    /// Render one frame: menu bar + text layer on top of graphics layer.
     /// </summary>
     public void RenderFrame()
     {
         // Clear buffers
         Array.Clear(_textBuffer);
         Array.Clear(_graphicsBuffer);
+        Array.Clear(_compositeBuffer);
 
-        // Render both layers
+        // Render menu bar into top of composite buffer
+        _menuBar.Render(_compositeBuffer, ScreenWidth);
+
+        // Render both PC-98 layers
         _graphicsRenderer.Render(_graphicsBuffer, ScreenWidth, ScreenHeight);
-        _textRenderer.Render(_textBuffer, ScreenWidth, ScreenHeight);
+        bool textEnabled = _textGdc.DisplayEnabled;
+        if (textEnabled)
+            _textRenderer.Render(_textBuffer, ScreenWidth, ScreenHeight);
 
-        // Composite: text layer takes priority where non-transparent
-        for (int i = 0; i < _compositeBuffer.Length; i++)
+        // Composite PC-98 screen below menu bar
+        int menuOffset = MenuBar.MenuBarHeight * ScreenWidth;
+        for (int i = 0; i < ScreenWidth * ScreenHeight; i++)
         {
-            uint textPixel = _textBuffer[i];
+            uint textPixel = textEnabled ? _textBuffer[i] : 0;
             if (textPixel != 0x00000000)
-                _compositeBuffer[i] = textPixel;
+                _compositeBuffer[menuOffset + i] = textPixel;
             else
-                _compositeBuffer[i] = _graphicsBuffer[i];
+                _compositeBuffer[menuOffset + i] = _graphicsBuffer[i];
+        }
+
+        // Render dropdown overlay on top of PC-98 screen area
+        _menuBar.RenderDropdown(
+            _compositeBuffer.AsSpan(menuOffset).ToArray() is var _ ? _compositeBuffer : _compositeBuffer,
+            ScreenWidth, ScreenHeight);
+
+        // Dropdown renders into the screen area (below menu bar)
+        if (_menuBar.IsDropdownOpen)
+        {
+            // Re-render dropdown directly into composite buffer at menu offset
+            var dropdownArea = new uint[ScreenWidth * ScreenHeight];
+            Array.Copy(_compositeBuffer, menuOffset, dropdownArea, 0, ScreenWidth * ScreenHeight);
+            _menuBar.RenderDropdown(dropdownArea, ScreenWidth, ScreenHeight);
+            Array.Copy(dropdownArea, 0, _compositeBuffer, menuOffset, ScreenWidth * ScreenHeight);
         }
 
         // Update texture and present
@@ -109,7 +141,6 @@ public class Display : IDisposable
     /// <summary>
     /// Poll SDL events. Returns true if the application should continue running.
     /// </summary>
-    // Queue of key events (ASCII, scancode) from SDL
     private readonly Queue<(byte ascii, byte scancode, byte funcKey)> _keyQueue = new();
 
     public bool PollEvents()
@@ -118,6 +149,16 @@ public class Display : IDisposable
         {
             if (e.type == SDL_EventType.SDL_QUIT)
                 return false;
+
+            if (e.type == SDL_EventType.SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT)
+            {
+                // Convert window coordinates to unscaled pixel coordinates
+                int x = e.button.x / _scale;
+                int y = e.button.y / _scale;
+                _menuBar.HandleMouseClick(x, y);
+                continue;
+            }
+
             if (e.type == SDL_EventType.SDL_KEYDOWN)
             {
                 byte ascii = SdlKeyToAscii(e.key.keysym);

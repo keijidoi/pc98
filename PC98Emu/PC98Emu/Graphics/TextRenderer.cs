@@ -95,7 +95,8 @@ public class TextRenderer
             if (py >= 400) break;
 
             byte glyphRow = glyph[row];
-            bool isUnderlineRow = underline && row == CharHeight - 1;
+            // Don't draw underline on space/null characters (prevents blue horizontal lines)
+            bool isUnderlineRow = underline && row == CharHeight - 1 && charCode > 0x20;
 
             for (int bit = 0; bit < CharWidth; bit++)
             {

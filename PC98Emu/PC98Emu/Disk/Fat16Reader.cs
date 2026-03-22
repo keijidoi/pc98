@@ -85,18 +85,76 @@ public class Fat16Reader
     }
 
     /// <summary>
-    /// Find a file in the root directory by 8.3 name.
+    /// Find a file by path (supports subdirectories, e.g., "MAKYO\MAKYO.EXE").
     /// Returns (startCluster, fileSize) or (0, 0) if not found.
     /// </summary>
     public (ushort cluster, uint size) FindFile(string filename)
     {
         if (!IsInitialized) return (0, 0);
 
-        // Convert to 8.3 format
+        // Strip drive letter (e.g., "B:\MAKYO\GAME.EXE" → "MAKYO\GAME.EXE")
+        string path = filename;
+        if (path.Length >= 2 && path[1] == ':')
+            path = path.Substring(2);
+        path = path.TrimStart('\\', '/');
+
+        // Split into directory components and final filename
+        string[] parts = path.Split(new[] { '\\', '/' });
+
+        if (parts.Length == 1)
+        {
+            // Simple filename — search root directory
+            return FindFileInRootDir(parts[0], skipDirs: true);
+        }
+
+        // Walk subdirectories
+        ushort dirCluster = 0; // 0 = root directory
+        for (int i = 0; i < parts.Length - 1; i++)
+        {
+            var (cl, _) = dirCluster == 0
+                ? FindFileInRootDir(parts[i], skipDirs: false, dirsOnly: true)
+                : FindFileInSubDir(dirCluster, parts[i], skipDirs: false, dirsOnly: true);
+            if (cl == 0) return (0, 0); // Directory not found
+            dirCluster = cl;
+        }
+
+        // Search the final filename in the target subdirectory
+        return FindFileInSubDir(dirCluster, parts[^1], skipDirs: true);
+    }
+
+    /// <summary>
+    /// Resolve a directory path (e.g., "MAKYO" or "MAKYO\SUB") to its starting cluster.
+    /// Returns 0 for root directory, or the cluster number for subdirectories.
+    /// Returns -1 if the directory is not found.
+    /// </summary>
+    public int ResolveDirPath(string dirPath)
+    {
+        if (!IsInitialized || string.IsNullOrEmpty(dirPath)) return 0; // root
+
+        string path = dirPath.Replace('/', '\\').Trim('\\');
+        if (path.Length == 0) return 0;
+
+        string[] parts = path.Split('\\');
+        ushort dirCluster = 0;
+        for (int i = 0; i < parts.Length; i++)
+        {
+            var (cl, _) = dirCluster == 0
+                ? FindFileInRootDir(parts[i], skipDirs: false, dirsOnly: true)
+                : FindFileInSubDir(dirCluster, parts[i], skipDirs: false, dirsOnly: true);
+            if (cl == 0) return -1; // not found
+            dirCluster = cl;
+        }
+        return dirCluster;
+    }
+
+    /// <summary>
+    /// Find a directory entry in the root directory.
+    /// </summary>
+    private (ushort cluster, uint size) FindFileInRootDir(string filename, bool skipDirs, bool dirsOnly = false)
+    {
         string name83 = To83Name(filename);
         if (name83 == null) return (0, 0);
 
-        // Scan root directory
         for (int sec = 0; sec < _rootDirSectors; sec++)
         {
             byte[] data = ReadLogicalSector(_rootDirStartLba + sec);
@@ -106,12 +164,14 @@ public class Fat16Reader
             for (int e = 0; e < entriesPerSector; e++)
             {
                 int off = e * 32;
-                if (data[off] == 0x00) return (0, 0); // End of directory
-                if (data[off] == 0xE5) continue; // Deleted entry
-                if ((data[off + 0x0B] & 0x08) != 0) continue; // Volume label
-                if ((data[off + 0x0B] & 0x10) != 0) continue; // Directory
+                if (data[off] == 0x00) return (0, 0);
+                if (data[off] == 0xE5) continue;
+                byte attr = data[off + 0x0B];
+                if ((attr & 0x08) != 0) continue; // Volume label
+                bool isDir = (attr & 0x10) != 0;
+                if (skipDirs && isDir) continue;
+                if (dirsOnly && !isDir) continue;
 
-                // Compare 11-byte name
                 string entryName = "";
                 for (int i = 0; i < 11; i++)
                     entryName += (char)data[off + i];
@@ -121,12 +181,102 @@ public class Fat16Reader
                     ushort cluster = (ushort)(data[off + 0x1A] | (data[off + 0x1B] << 8));
                     uint size = (uint)(data[off + 0x1C] | (data[off + 0x1D] << 8) |
                                        (data[off + 0x1E] << 16) | (data[off + 0x1F] << 24));
-                    Console.Error.WriteLine($"[FAT16] Found '{entryName.Trim()}' cluster={cluster} size={size}");
+                    Console.Error.WriteLine($"[FAT16] Found '{entryName.Trim()}' cluster={cluster} size={size} dir={isDir}");
                     return (cluster, size);
                 }
             }
         }
         return (0, 0);
+    }
+
+    /// <summary>
+    /// Find a file/directory in a subdirectory given its start cluster.
+    /// </summary>
+    private (ushort cluster, uint size) FindFileInSubDir(ushort dirCluster, string filename, bool skipDirs, bool dirsOnly = false)
+    {
+        string name83 = To83Name(filename);
+        if (name83 == null || _fat == null) return (0, 0);
+
+        Console.Error.WriteLine($"[FAT16] Searching subdir cluster={dirCluster} for '{name83}' (skipDirs={skipDirs} dirsOnly={dirsOnly})");
+
+        int eofMarker = _isFat12 ? 0xFF8 : 0xFFF8;
+        ushort cl = dirCluster;
+
+        while (cl >= 2 && cl < eofMarker)
+        {
+            int lba = _dataStartLba + (cl - 2) * _sectorsPerCluster;
+            for (int s = 0; s < _sectorsPerCluster; s++)
+            {
+                byte[] data = ReadLogicalSector(lba + s);
+                if (data == null) { Console.Error.WriteLine($"[FAT16] ReadLogicalSector({lba + s}) returned null"); continue; }
+
+                int entriesPerSector = _bytesPerSector / 32;
+                for (int e = 0; e < entriesPerSector; e++)
+                {
+                    int off = e * 32;
+                    if (data[off] == 0x00) { Console.Error.WriteLine($"[FAT16] End of subdir at entry {e}"); return (0, 0); }
+                    if (data[off] == 0xE5) continue;
+                    byte attr = data[off + 0x0B];
+                    if ((attr & 0x08) != 0) continue;
+                    bool isDir = (attr & 0x10) != 0;
+
+                    string entryName = "";
+                    for (int i = 0; i < 11; i++)
+                        entryName += (char)data[off + i];
+                    ushort eCl = (ushort)(data[off + 0x1A] | (data[off + 0x1B] << 8));
+                    uint eSz = (uint)(data[off + 0x1C] | (data[off + 0x1D] << 8) |
+                                      (data[off + 0x1E] << 16) | (data[off + 0x1F] << 24));
+                    Console.Error.WriteLine($"[FAT16] SubDir entry: '{entryName}' attr={attr:X2} cluster={eCl} size={eSz}");
+
+                    if (skipDirs && isDir) continue;
+                    if (dirsOnly && !isDir) continue;
+
+                    if (entryName == name83)
+                    {
+                        Console.Error.WriteLine($"[FAT16] Found '{entryName.Trim()}' in subdir cluster={eCl} size={eSz} dir={isDir}");
+                        return (eCl, eSz);
+                    }
+                }
+            }
+            cl = _fat[cl];
+        }
+        Console.Error.WriteLine($"[FAT16] Not found in subdir: '{name83}'");
+        return (0, 0);
+    }
+
+    /// <summary>
+    /// Get directory entries from a subdirectory given its start cluster.
+    /// </summary>
+    public List<byte[]> GetSubDirEntries(ushort dirCluster)
+    {
+        var entries = new List<byte[]>();
+        if (!IsInitialized || _fat == null) return entries;
+
+        int eofMarker = _isFat12 ? 0xFF8 : 0xFFF8;
+        ushort cl = dirCluster;
+
+        while (cl >= 2 && cl < eofMarker)
+        {
+            int lba = _dataStartLba + (cl - 2) * _sectorsPerCluster;
+            for (int s = 0; s < _sectorsPerCluster; s++)
+            {
+                byte[] data = ReadLogicalSector(lba + s);
+                if (data == null) continue;
+
+                int entriesPerSector = _bytesPerSector / 32;
+                for (int e = 0; e < entriesPerSector; e++)
+                {
+                    int off = e * 32;
+                    if (data[off] == 0x00) return entries;
+                    if (data[off] == 0xE5) continue;
+                    var entry = new byte[32];
+                    Array.Copy(data, off, entry, 0, 32);
+                    entries.Add(entry);
+                }
+            }
+            cl = _fat[cl];
+        }
+        return entries;
     }
 
     /// <summary>

@@ -37,6 +37,8 @@ public class Emulator
     private readonly GDC _textGdc;
     private readonly GDC _graphicsGdc;
     private readonly GvramBankController _gvramBank;
+    private readonly GRCG _grcg;
+    private readonly AnalogPalette _analogPalette;
     private readonly TextRenderer _textRenderer;
     private readonly GraphicsRenderer _graphicsRenderer;
 
@@ -102,6 +104,9 @@ public class Emulator
         _textGdc = new GDC(isText: true);
         _graphicsGdc = new GDC(isText: false);
         _gvramBank = new GvramBankController(_bus);
+        _grcg = new GRCG(_bus);
+        _analogPalette = new AnalogPalette();
+        _bus.Grcg = _grcg; // Wire GRCG into SystemBus for GVRAM intercept
 
         // Sound (slave PIC IRQ3 = system IRQ11 typically, but just wire to slave)
         _ym2608 = new YM2608(() => _slavePic.RaiseIRQ(3));
@@ -120,7 +125,7 @@ public class Emulator
 
         // Renderers
         _textRenderer = new TextRenderer(_bus.GetMemoryDirect());
-        _graphicsRenderer = new GraphicsRenderer(_bus.GetMemoryDirect(), _bus);
+        _graphicsRenderer = new GraphicsRenderer(_bus.GetMemoryDirect(), _bus, _analogPalette);
 
         // BIOS
         _bios = new CompatibleBios(_cpu, _bus);
@@ -145,6 +150,8 @@ public class Emulator
         _bus.RegisterDevice(_textGdc);
         _bus.RegisterDevice(_graphicsGdc);
         _bus.RegisterDevice(_gvramBank);
+        _bus.RegisterDevice(_grcg);
+        _bus.RegisterDevice(_analogPalette);
         _bus.RegisterDevice(_ym2608);
         _bus.RegisterDevice(_rtc);
         _bus.RegisterDevice(_serial);
@@ -177,6 +184,8 @@ public class Emulator
         {
             _textGdc.Tick(141844);
             _graphicsGdc.Tick(141844);
+            // Raise IRQ 2 (VSYNC) on master PIC → INT 0Ah
+            _masterPic.RaiseIRQ(2);
         });
 
         // Set initial CPU state: enable interrupts
@@ -232,6 +241,42 @@ public class Emulator
         }
     }
 
+    /// <summary>
+    /// Reset CPU, memory, and BIOS state for rebooting with a new disk image.
+    /// </summary>
+    private void ResetForReboot()
+    {
+        // Clear main memory (keep VRAM and BIOS ROM intact)
+        var mem = _bus.GetMemoryDirect();
+        Array.Clear(mem, 0, 0xA0000); // Clear conventional memory
+
+        // Reset CPU
+        _cpu.AX = 0; _cpu.BX = 0; _cpu.CX = 0; _cpu.DX = 0;
+        _cpu.SI = 0; _cpu.DI = 0; _cpu.BP = 0;
+        _cpu.CS = 0; _cpu.IP = 0;
+        _cpu.DS = 0; _cpu.ES = 0;
+        _cpu.SS = 0; _cpu.SP = 0x0400;
+        _cpu.Flags.Value = 0;
+        _cpu.Flags.IF = true;
+        _cpu.Halted = false;
+
+        // Unmount existing HDD
+        _diskManager.UnmountHDD(0);
+
+        // Reset DiskBios partition offset (set during previous boot)
+        if (_bios.DiskBios != null)
+            _bios.DiskBios.SetPartitionOffset(0);
+
+        // Reset DosBios state
+        if (_bios.DosBiosInstance != null)
+            _bios.DosBiosInstance.Reset();
+
+        // Re-initialize BIOS (sets up IVT, BDA, etc.)
+        _bios.Initialize();
+
+        Console.WriteLine("Emulator state reset for reboot.");
+    }
+
     public void Run()
     {
         // Initialize display and audio (requires SDL2)
@@ -241,10 +286,10 @@ public class Emulator
         try
         {
             Font.InitKanjiRom();
-            _display = new Display(_textRenderer, _graphicsRenderer);
+            _display = new Display(_textRenderer, _graphicsRenderer, _textGdc);
             _display.Init();
             hasDisplay = true;
-            Console.WriteLine("Display initialized (640x800)");
+            Console.WriteLine("Display initialized (640x424)");
         }
         catch (Exception ex)
         {
@@ -276,8 +321,8 @@ public class Emulator
         // This catches IO.SYS SYSINIT code relocation into MSDOS.SYS BSS
         int watchHitCount = 0;
         int watchLastStep = 0;
-        // Watch IVT entries 0x60-0x8F (INT 18h through INT 23h) to catch corruption
-        _bus.SetWatchpointRange(0x60, 0x8F);
+        // Watch IVT entries 0x60-0x107 (INT 18h through INT 41h) to catch corruption
+        _bus.SetWatchpointRange(0x60, 0x107);
         _bus.OnWatchHit = (addr, oldVal, newVal) =>
         {
             watchHitCount++;
@@ -287,6 +332,16 @@ public class Emulator
         };
         Console.WriteLine("Emulation started. Close the window to exit.");
         bool quit = false;
+        string? pendingHdiPath = null;
+        if (_display != null)
+        {
+            _display.MenuBar.OnHdiSelected = (path) =>
+            {
+                pendingHdiPath = path;
+                Console.WriteLine($"HDI selected: {path}");
+            };
+            _display.MenuBar.OnExitRequested = () => { quit = true; };
+        }
         _frameCycleAccumulator = 0;
         int frameCount = 0;
         bool vramDumped = false;
@@ -317,6 +372,9 @@ public class Emulator
         bool sysinitActive = false; // Flag: tracing SYSINIT
         // commandComTraceCount removed — CMD trace disabled
         byte[]? savedIoSysRuntime = null; // IO.SYS runtime snapshot (segment 0060) saved before DOSINIT
+        byte[]? savedDpb = null; // DPB bytes saved after initial boot reaches A>
+        bool dpbSaved = false; // Flag: DPB has been saved from initial boot
+        bool dpbRestoredAfterReboot = false; // Flag: DPB restored after reboot DOSINIT
 
         while (!quit)
         {
@@ -544,6 +602,20 @@ public class Emulator
                     break;
                 }
 
+                // Fast-forward I/O delay loops during boot (port 0x5F only)
+                // Port 0x5F is the I/O wait port — a pure timing delay.
+                // Only skip in secondary loader segment (1D20) before boot completes.
+                if (_cpu.CS == 0x1D20 && !vramDumped && _cpu.CX > 100)
+                {
+                    var dm = _bus.GetMemoryDirect();
+                    int dip = (_cpu.CS << 4) + _cpu.IP;
+                    // Pattern: E6 5F (OUT 5F,AL) followed by E2 xx (LOOP)
+                    if (dip + 3 < dm.Length && dm[dip] == 0xE6 && dm[dip + 1] == 0x5F && dm[dip + 2] == 0xE2)
+                    {
+                        _cpu.CX = 1;
+                    }
+                }
+
                 // Secondary loader boot menu bypass: HLT at 1D20:171F followed by
                 // EB FD (JMP $-1) at 1D20:1720. This is the boot menu waiting for
                 // keyboard input or timer timeout. Patch EB FD → NOP NOP and wake CPU
@@ -567,8 +639,16 @@ public class Emulator
                         }
                         for (int a = 0xA2000; a < 0xA4000; a += 2)
                         {
-                            patchMem[a] = 0xE1;     // visible, white
+                            patchMem[a] = 0x00;     // invisible (only visible when text is written)
                             patchMem[a + 1] = 0x00;
+                        }
+                        // Show "Booting..." message after clearing VRAM
+                        string bmsg = "Booting...";
+                        for (int ci = 0; ci < bmsg.Length; ci++)
+                        {
+                            int boff = (12 * 80 + 35 + ci) * 2;
+                            patchMem[0xA0000 + boff] = (byte)bmsg[ci];
+                            patchMem[0xA0000 + boff + 1] = 0x00;
                         }
                         Console.Error.WriteLine("[BOOT-MENU] Patched secondary loader JMP at 1D20:1720 → NOP NOP, cleared VRAM, resuming");
                         continue;
@@ -1232,6 +1312,23 @@ public class Emulator
                             }
                         }
                         bootMenuVramDirty = false;
+
+                        // Restore DPB after reboot's DOSINIT completes.
+                        // The boot menu is the last DOSINIT2 step before COMMAND.COM.
+                        // The DPB at 0060:0ABC may not be properly initialized after
+                        // reboot because the DOSINIT2 code path differs slightly.
+                        // Restore the saved DPB from the initial boot.
+                        if (savedDpb != null && !dpbRestoredAfterReboot)
+                        {
+                            dpbRestoredAfterReboot = true;
+                            int dpbPhys = 0x600 + 0x0ABC;
+                            Array.Copy(savedDpb, 0, kmem, dpbPhys, savedDpb.Length);
+                            Console.Error.Write($"[DPB-RESTORE] Restored driver data at 0060:0ABC (+0E=");
+                            Console.Error.Write($"{kmem[dpbPhys + 0x0E]:X2}{kmem[dpbPhys + 0x0F]:X2}): ");
+                            for (int b = 0; b < 32; b++)
+                                Console.Error.Write($"{kmem[dpbPhys + b]:X2} ");
+                            Console.Error.WriteLine();
+                        }
                     }
                 }
 
@@ -1784,6 +1881,23 @@ public class Emulator
                             hangDetected = true;
                             Console.Error.WriteLine($"\n[WILD] CPU at zeroed BIOS ROM: {_cpu.CS:X4}:{_cpu.IP:X4} (phys 0x{wildPhys:X5}) after {stepCount} steps");
                             Console.Error.WriteLine($"[WILD] AX={_cpu.AX:X4} BX={_cpu.BX:X4} CX={_cpu.CX:X4} DX={_cpu.DX:X4} DS={_cpu.DS:X4} ES={_cpu.ES:X4} SS={_cpu.SS:X4} SP={_cpu.SP:X4}");
+                            // Dump bytes at last traced instruction to see the opcode
+                            var lastE = traceRing[(traceIdx + traceSize - 1) % traceSize];
+                            int lastPhys = (lastE.cs << 4) + lastE.ip;
+                            Console.Error.Write($"[WILD] Last instr at {lastE.cs:X4}:{lastE.ip:X4} bytes: ");
+                            for (int b = 0; b < 8 && lastPhys + b < mem4.Length; b++)
+                                Console.Error.Write($"{mem4[lastPhys + b]:X2} ");
+                            Console.Error.WriteLine();
+                            // Check IVT - scan for the wild destination
+                            Console.Error.Write("[WILD] IVT scan for destination: ");
+                            for (int iv = 0; iv < 256; iv++)
+                            {
+                                ushort ivOff = (ushort)(mem4[iv * 4] | (mem4[iv * 4 + 1] << 8));
+                                ushort ivSeg = (ushort)(mem4[iv * 4 + 2] | (mem4[iv * 4 + 3] << 8));
+                                if (ivSeg == _cpu.CS && ivOff == _cpu.IP)
+                                    Console.Error.Write($"INT {iv:X2} ");
+                            }
+                            Console.Error.WriteLine();
                             Console.Error.WriteLine($"[WILD] Last {traceSize} instructions:");
                             for (int t = 0; t < traceSize; t++)
                             {
@@ -1802,6 +1916,34 @@ public class Emulator
                             Console.Error.WriteLine();
                         }
                     }
+                }
+
+                // Fix IO.SYS cluster normalization infinite loop at 0636:15A9.
+                // The loop shifts SI right until SI==0x0100, but when the driver's
+                // internal data at [DI+0E] is 0 (uninitialized after reboot), the
+                // code at 15E2 sets SI=0 and enters the loop which never terminates.
+                // Fix: set SI = bytes_per_cluster = bps * spc (e.g., 1024*8=8192=0x2000).
+                // The loop will shift SI: 0x2000→0x1000→0x800→0x400→0x200→0x100 (5 shifts).
+                // Also write the correct bytes_per_cluster value to [DI+0E].
+                if (_cpu.CS == 0x0636 && _cpu.IP == 0x15A9 && _cpu.SI == 0)
+                {
+                    var fmem = _bus.GetMemoryDirect();
+                    // Read BPB from 0060:2B4E: bytes-per-sector and sectors-per-cluster
+                    int bpbBase = 0x600 + 0x2B4E;
+                    ushort bps = (ushort)(fmem[bpbBase] | (fmem[bpbBase + 1] << 8));
+                    byte spc = fmem[bpbBase + 2];
+                    if (bps == 0) bps = 1024;
+                    if (spc == 0) spc = 8;
+                    ushort clusterSize = (ushort)(bps * spc); // 0x2000 = 8192
+                    _cpu.SI = clusterSize;
+                    // Write bytes_per_cluster to [DI+0E] so future calls skip normalization
+                    int dpbAddr = 0x600 + _cpu.DI + 0x0E;
+                    if (dpbAddr + 1 < fmem.Length)
+                    {
+                        fmem[dpbAddr] = (byte)(clusterSize & 0xFF);
+                        fmem[dpbAddr + 1] = (byte)(clusterSize >> 8);
+                    }
+                    Console.Error.WriteLine($"[DPB-FIX] SI=0 → SI={clusterSize:X4} (bps={bps}*spc={spc}), [DI+0E]={clusterSize:X4}");
                 }
 
                 // Detect JMP $ (EB FE) or JMP $-1 (EB FD) infinite loop
@@ -2047,6 +2189,33 @@ public class Emulator
                         }
                         Console.Error.WriteLine();
                     }
+
+                    // Dump last 200 trace entries at frame 300 for debugging
+                    Console.Error.WriteLine("[VRAM2] Last 50 trace:");
+                    int trStart = (traceIdx + traceSize - 50) % traceSize;
+                    for (int t = 0; t < 50; t++)
+                    {
+                        var e = traceRing[(trStart + t) % traceSize];
+                        if (e.cs == 0 && e.ip == 0) continue;
+                        Console.Error.WriteLine($"  {e.cs:X4}:{e.ip:X4} AX={e.ax:X4} BX={e.bx:X4} CX={e.cx:X4} DX={e.dx:X4} DS={e.ds:X4} ES={e.es:X4} SP={e.sp:X4} FL={e.flags:X4} SI={e.si:X4} DI={e.di:X4}");
+                    }
+
+                    // Save DPB/driver data after initial boot reaches A> prompt.
+                    // DI=0ABC is the IO.SYS block device driver's internal DPB-like
+                    // structure at DS=0060. Save it so reboot can restore it.
+                    if (!dpbSaved)
+                    {
+                        var dmem = _bus.GetMemoryDirect();
+                        int dpbPhys = 0x600 + 0x0ABC;
+                        savedDpb = new byte[256]; // Save 256 bytes of driver internal data
+                        Array.Copy(dmem, dpbPhys, savedDpb, 0, 256);
+                        dpbSaved = true;
+                        Console.Error.Write("[DPB-SAVE] Driver data at 0060:0ABC (+0E=");
+                        Console.Error.Write($"{dmem[dpbPhys + 0x0E]:X2}{dmem[dpbPhys + 0x0F]:X2}): ");
+                        for (int b = 0; b < 32; b++)
+                            Console.Error.Write($"{savedDpb[b]:X2} ");
+                        Console.Error.WriteLine();
+                    }
                 }
 
                 if (hasDisplay)
@@ -2056,7 +2225,324 @@ public class Emulator
                     {
                         _display!.RenderFrame();
                     }
-                    quit = !_display!.PollEvents();
+                    if (!_display!.PollEvents())
+                        quit = true;
+                }
+
+                // Handle HDI selection from menu (reboot overrides quit)
+                if (pendingHdiPath != null)
+                {
+                    string hdiPath = pendingHdiPath;
+                    pendingHdiPath = null;
+                    try
+                    {
+                        byte[] data = File.ReadAllBytes(hdiPath);
+                        string ext = Path.GetExtension(hdiPath).ToLowerInvariant().TrimStart('.');
+                        Console.Error.WriteLine($"[HDI-MOUNT] Loading as drive B: {Path.GetFileName(hdiPath)} ({data.Length} bytes)");
+
+                        // Mount as HDD 1 (drive B:) — keep existing DOS environment on HDD 0
+                        LoadHardDisk(1, data, ext);
+
+                        // Create Fat16Reader for the new disk
+                        var newHdd = _diskManager.GetHDD(1);
+                        if (newHdd != null)
+                        {
+                            // Calculate PBR LBA (partition starts at cylinder 1)
+                            int pbrLba = (1 * newHdd.Heads + 0) * newHdd.SectorsPerTrack;
+                            var fat16B = new PC98Emu.Disk.Fat16Reader(newHdd, pbrLba);
+                            if (fat16B.Initialize())
+                            {
+                                fat16B.ListRootDir();
+                                _bios.SetFat16ReaderForDrive(1, fat16B); // Drive B:
+                                Console.Error.WriteLine($"[HDI-MOUNT] Drive B: mounted successfully");
+
+                                // Dump MAKYO\CONFIG.SYS if present
+                                var (cfgCl, cfgSz) = fat16B.FindFile("MAKYO\\CONFIG.SYS");
+                                if (cfgCl != 0)
+                                {
+                                    byte[]? cfgData = fat16B.ReadFile(cfgCl, cfgSz);
+                                    if (cfgData != null)
+                                        Console.Error.WriteLine($"[HDI-MOUNT] MAKYO\\CONFIG.SYS content:\n{System.Text.Encoding.GetEncoding(932).GetString(cfgData)}");
+                                }
+                                // Also dump root CONFIG.SYS
+                                var (cfgCl2, cfgSz2) = fat16B.FindFile("CONFIG.SYS");
+                                if (cfgCl2 != 0)
+                                {
+                                    byte[]? cfgData2 = fat16B.ReadFile(cfgCl2, cfgSz2);
+                                    if (cfgData2 != null)
+                                        Console.Error.WriteLine($"[HDI-MOUNT] CONFIG.SYS content:\n{System.Text.Encoding.GetEncoding(932).GetString(cfgData2)}");
+                                }
+
+                                // Parse AUTOEXEC.BAT and auto-execute the game
+                                var (autoCl, autoSz) = fat16B.FindFile("AUTOEXEC.BAT");
+                                if (autoCl != 0)
+                                {
+                                    byte[]? autoData = fat16B.ReadFile(autoCl, autoSz);
+                                    if (autoData != null)
+                                    {
+                                        string autoText = System.Text.Encoding.ASCII.GetString(autoData);
+                                        Console.Error.WriteLine($"[HDI-MOUNT] AUTOEXEC.BAT content:\n{autoText}");
+
+                                        // Parse: find CD and last executable command
+                                        string? cdDir = null;
+                                        string? exeName = null;
+                                        foreach (var rawLine in autoText.Split('\n'))
+                                        {
+                                            string line = rawLine.Trim().TrimEnd('\r');
+                                            // Strip NUL bytes and control chars
+                                            line = new string(line.Where(c => c >= 0x20).ToArray()).Trim();
+                                            if (string.IsNullOrEmpty(line)) continue;
+                                            string upper = line.ToUpperInvariant();
+                                            if (upper.StartsWith("REM ") || upper.StartsWith("@ECHO") ||
+                                                upper.StartsWith("SET ") || upper.StartsWith("PATH") ||
+                                                upper.StartsWith("LH ")) continue;
+                                            if (upper.StartsWith("CD ") || upper.StartsWith("CD\\"))
+                                            {
+                                                cdDir = line.Substring(upper.StartsWith("CD\\") ? 2 : 3).Trim().TrimStart('\\');
+                                                continue;
+                                            }
+                                            // Last remaining line is the executable
+                                            exeName = line.Split(' ')[0]; // Take command name without args
+                                        }
+
+                                        if (exeName != null)
+                                        {
+                                            // Build full path on B: drive
+                                            string gamePath = cdDir != null ? $"{cdDir}\\{exeName}" : exeName;
+                                            Console.Error.WriteLine($"[HDI-MOUNT] Auto-exec: searching for '{gamePath}'");
+
+                                            // Try with common extensions (.EXE, .COM, .BAT)
+                                            string[] exts = { ".EXE", ".COM", ".BAT", "" };
+                                            byte[]? gameData = null;
+                                            string foundName = "";
+                                            foreach (var tryExt in exts)
+                                            {
+                                                string tryPath = gamePath.Contains('.') ? gamePath : gamePath + tryExt;
+                                                var (gc, gs) = fat16B.FindFile(tryPath);
+                                                if (gc != 0)
+                                                {
+                                                    gameData = fat16B.ReadFile(gc, gs);
+                                                    foundName = tryPath;
+                                                    Console.Error.WriteLine($"[HDI-MOUNT] Found: '{foundName}' size={gs}");
+
+                                                    // If BAT file, parse it to find the real executable
+                                                    if (tryExt == ".BAT" && gameData != null)
+                                                    {
+                                                        string batHex = BitConverter.ToString(gameData);
+                                                        Console.Error.WriteLine($"[HDI-MOUNT] BAT hex: {batHex}");
+                                                        string batText = System.Text.Encoding.GetEncoding(932).GetString(gameData); // Shift-JIS
+                                                        Console.Error.WriteLine($"[HDI-MOUNT] BAT content: [{batText.Trim()}]");
+                                                        string? realExe = null;
+                                                        foreach (var bLine in batText.Split('\n'))
+                                                        {
+                                                            string bl = new string(bLine.Trim().TrimEnd('\r').Where(c => c >= 0x20).ToArray()).Trim();
+                                                            if (string.IsNullOrEmpty(bl)) continue;
+                                                            string bu = bl.ToUpperInvariant();
+                                                            if (bu.StartsWith("REM ") || bu.StartsWith("@ECHO") || bu.StartsWith("SET ") || bu.StartsWith("PAUSE")) continue;
+                                                            realExe = bl.Split(' ')[0];
+                                                        }
+                                                        if (realExe != null)
+                                                        {
+                                                            // Search for the real executable in same directory
+                                                            string realPath = cdDir != null ? $"{cdDir}\\{realExe}" : realExe;
+                                                            Console.Error.WriteLine($"[HDI-MOUNT] BAT references: '{realPath}'");
+                                                            string[] realExts = { ".EXE", ".COM", "" };
+                                                            foreach (var re in realExts)
+                                                            {
+                                                                string rp = realPath.Contains('.') ? realPath : realPath + re;
+                                                                var (rc, rs) = fat16B.FindFile(rp);
+                                                                if (rc != 0)
+                                                                {
+                                                                    gameData = fat16B.ReadFile(rc, rs);
+                                                                    foundName = rp;
+                                                                    Console.Error.WriteLine($"[HDI-MOUNT] Found real game: '{foundName}' size={rs}");
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    break;
+                                                }
+                                            }
+
+                                            if (gameData != null && gameData.Length > 0)
+                                            {
+                                                Console.Error.WriteLine($"[HDI-MOUNT] Loading game '{foundName}' ({gameData.Length} bytes)");
+
+                                                // Load and execute directly
+                                                var mem = _bus.GetMemoryDirect();
+                                                bool isExe = gameData.Length >= 2 && gameData[0] == 0x4D && gameData[1] == 0x5A;
+                                                ushort loadSeg = 0x1800; // Load above DOS kernel (ends ~0x1600)
+
+                                                if (isExe)
+                                                {
+                                                    // Parse EXE header
+                                                    int headerSize = (gameData[8] | (gameData[9] << 8)) * 16;
+                                                    int initSS = gameData[0x0E] | (gameData[0x0F] << 8);
+                                                    int initSP = gameData[0x10] | (gameData[0x11] << 8);
+                                                    int initIP = gameData[0x14] | (gameData[0x15] << 8);
+                                                    int initCS = gameData[0x16] | (gameData[0x17] << 8);
+                                                    int relocCount = gameData[6] | (gameData[7] << 8);
+                                                    int relocOff = gameData[0x18] | (gameData[0x19] << 8);
+
+                                                    ushort pspSeg = loadSeg;
+                                                    ushort codeSeg = (ushort)(pspSeg + 0x10); // PSP is 256 bytes = 16 paragraphs
+
+                                                    // Build proper PSP
+                                                    int pspAddr = pspSeg << 4;
+                                                    Array.Clear(mem, pspAddr, 256);
+                                                    mem[pspAddr] = 0xCD;      // INT 20h
+                                                    mem[pspAddr + 1] = 0x20;
+                                                    mem[pspAddr + 2] = 0xFF;  // Top of memory (low)
+                                                    mem[pspAddr + 3] = 0x9F;  // Top of memory (high) = 0x9FFF
+                                                    // Parent PSP = self (no parent)
+                                                    mem[pspAddr + 0x16] = (byte)(pspSeg & 0xFF);
+                                                    mem[pspAddr + 0x17] = (byte)(pspSeg >> 8);
+                                                    // JFT: handles 0-4 = SFT indices 0-4, rest = 0xFF (unused)
+                                                    for (int jj = 0; jj < 20; jj++)
+                                                        mem[pspAddr + 0x18 + jj] = (byte)(jj < 5 ? jj : 0xFF);
+                                                    // Environment segment (point to a valid empty environment)
+                                                    ushort envSeg = (ushort)(pspSeg - 1); // Just before PSP
+                                                    mem[(envSeg << 4)] = 0x00; // Empty environment (double NUL)
+                                                    mem[(envSeg << 4) + 1] = 0x00;
+                                                    mem[pspAddr + 0x2C] = (byte)(envSeg & 0xFF);
+                                                    mem[pspAddr + 0x2D] = (byte)(envSeg >> 8);
+                                                    // Max handle count
+                                                    mem[pspAddr + 0x32] = 20;
+                                                    mem[pspAddr + 0x33] = 0;
+                                                    // JFT pointer (far pointer to PSP+0x18)
+                                                    mem[pspAddr + 0x34] = 0x18;
+                                                    mem[pspAddr + 0x35] = 0x00;
+                                                    mem[pspAddr + 0x36] = (byte)(pspSeg & 0xFF);
+                                                    mem[pspAddr + 0x37] = (byte)(pspSeg >> 8);
+                                                    // INT 21h / RETF at PSP:0050
+                                                    mem[pspAddr + 0x50] = 0xCD;
+                                                    mem[pspAddr + 0x51] = 0x21;
+                                                    mem[pspAddr + 0x52] = 0xCB; // RETF
+
+                                                    // Copy code (skip EXE header)
+                                                    int codeLen = gameData.Length - headerSize;
+                                                    int loadAddr = codeSeg << 4;
+                                                    Array.Copy(gameData, headerSize, mem, loadAddr, codeLen);
+
+                                                    // Apply relocations
+                                                    for (int r = 0; r < relocCount; r++)
+                                                    {
+                                                        int rOff = relocOff + r * 4;
+                                                        if (rOff + 3 >= gameData.Length) break;
+                                                        int rOffset = gameData[rOff] | (gameData[rOff + 1] << 8);
+                                                        int rSeg = gameData[rOff + 2] | (gameData[rOff + 3] << 8);
+                                                        int fixAddr = loadAddr + rSeg * 16 + rOffset;
+                                                        if (fixAddr + 1 < mem.Length)
+                                                        {
+                                                            ushort val = (ushort)(mem[fixAddr] | (mem[fixAddr + 1] << 8));
+                                                            val += codeSeg;
+                                                            mem[fixAddr] = (byte)(val & 0xFF);
+                                                            mem[fixAddr + 1] = (byte)(val >> 8);
+                                                        }
+                                                    }
+
+                                                    // Set CPU registers
+                                                    _cpu.CS = (ushort)(codeSeg + initCS);
+                                                    _cpu.IP = (ushort)initIP;
+                                                    _cpu.SS = (ushort)(codeSeg + initSS);
+                                                    _cpu.SP = (ushort)initSP;
+                                                    _cpu.DS = pspSeg;
+                                                    _cpu.ES = pspSeg;
+                                                    Console.Error.WriteLine($"[HDI-MOUNT] EXE header: headerSize={headerSize} initCS={initCS:X4} initIP={initIP:X4} initSS={initSS:X4} initSP={initSP:X4} relocs={relocCount} relocOff={relocOff:X4}");
+                                                    Console.Error.WriteLine($"[HDI-MOUNT] EXE loaded: pspSeg={pspSeg:X4} codeSeg={codeSeg:X4} codeLen={codeLen} CS:IP={_cpu.CS:X4}:{_cpu.IP:X4} SS:SP={_cpu.SS:X4}:{_cpu.SP:X4}");
+                                                    // Dump first 16 bytes at entry point
+                                                    int entryPhys = (_cpu.CS << 4) + _cpu.IP;
+                                                    string hexEntry = "";
+                                                    for (int hh = 0; hh < 16 && entryPhys + hh < mem.Length; hh++)
+                                                        hexEntry += $"{mem[entryPhys + hh]:X2} ";
+                                                    Console.Error.WriteLine($"[HDI-MOUNT] Entry bytes: {hexEntry}");
+                                                }
+                                                else
+                                                {
+                                                    // COM file
+                                                    ushort pspSeg = loadSeg;
+                                                    int pspAddr = pspSeg << 4;
+                                                    Array.Clear(mem, pspAddr, 256);
+                                                    mem[pspAddr] = 0xCD;
+                                                    mem[pspAddr + 1] = 0x20;
+                                                    Array.Copy(gameData, 0, mem, pspAddr + 0x100, gameData.Length);
+                                                    _cpu.CS = pspSeg;
+                                                    _cpu.IP = 0x0100;
+                                                    _cpu.SS = pspSeg;
+                                                    _cpu.SP = 0xFFFE;
+                                                    _cpu.DS = pspSeg;
+                                                    _cpu.ES = pspSeg;
+                                                    Console.Error.WriteLine($"[HDI-MOUNT] COM loaded: CS:IP={_cpu.CS:X4}:0100");
+                                                }
+
+                                                // Reset DOS memory allocations for the directly loaded game
+                                                // The game will resize itself with AH=4A, then allocate with AH=48
+                                                _bios.DosBiosInstance!.ResetAllocationsForDirectLoad(loadSeg, (ushort)(0xA000 - loadSeg));
+
+                                                // Set current PSP to the game's PSP
+                                                _bios.DosBiosInstance!.SetCurrentPSP(loadSeg);
+
+                                                // Re-install sound driver stub IVT (gets overwritten during boot)
+                                                mem[0x104] = 0x00; mem[0x105] = 0x00; // INT 41h offset
+                                                mem[0x106] = 0x25; mem[0x107] = 0xE8; // INT 41h segment (E825:0000 = 0xE8250)
+                                                Console.Error.WriteLine($"[SOUND] Re-set IVT[41h] → E825:0000 before game launch");
+
+                                                // Re-install INT 2Ah (network/critical section) IRET stub
+                                                mem[0xA8] = 0x00; mem[0xA9] = 0x00; // INT 2Ah offset
+                                                mem[0xAA] = 0x24; mem[0xAB] = 0xE8; // INT 2Ah segment (E824:0000 = 0xE8240)
+                                                Console.Error.WriteLine($"[BIOS] Re-set IVT[2Ah] → E824:0000 before game launch");
+
+                                                // Switch DOS current drive to B: and set current directory to MAKYO
+                                                _bios.DosBiosInstance!.SetCurrentDrive(1);
+                                                _bios.DosBiosInstance!.SetCurrentDirectory(1, "MAKYO");
+
+                                                // Clear screen for game
+                                                for (int a = 0xA0000; a < 0xA2000; a += 2)
+                                                    { mem[a] = 0x20; mem[a + 1] = 0x00; }
+                                                for (int a = 0xA2000; a < 0xA4000; a += 2)
+                                                    { mem[a] = 0x00; mem[a + 1] = 0x00; }
+
+                                                Console.Error.WriteLine($"[HDI-MOUNT] Game launched!");
+
+                                                // Enable I/O debug to see what ports the game accesses
+                                                _bus.IoDebug = true;
+
+                                                // Unhalt CPU for game execution
+                                                _cpu.Halted = false;
+
+                                                // Trace first 200 instructions of game
+                                                for (int t = 0; t < 200; t++)
+                                                {
+                                                    var gmem = _bus.GetMemoryDirect();
+                                                    int traceAddr = ((_cpu.CS << 4) + _cpu.IP) & 0xFFFFF;
+                                                    byte op = gmem[traceAddr];
+                                                    byte op2 = traceAddr + 1 < gmem.Length ? gmem[traceAddr + 1] : (byte)0;
+                                                    Console.Error.WriteLine($"[GAME-TRACE] {t}: {_cpu.CS:X4}:{_cpu.IP:X4} op={op:X2}{op2:X2} AX={_cpu.AX:X4} BX={_cpu.BX:X4} CX={_cpu.CX:X4} DX={_cpu.DX:X4} DS={_cpu.DS:X4} SS:SP={_cpu.SS:X4}:{_cpu.SP:X4} F={(_cpu.Flags.CF?"C":".")}{(_cpu.Flags.ZF?"Z":".")}{(_cpu.Flags.IF?"I":".")}");
+                                                    if (_cpu.Halted) { Console.Error.WriteLine("[GAME-TRACE] CPU halted!"); break; }
+                                                    try { StepCpu(); }
+                                                    catch (Exception ex) { Console.Error.WriteLine($"[GAME-TRACE] Exception: {ex.Message}"); break; }
+                                                }
+                                            }
+                                            else
+                                            {
+                                                Console.Error.WriteLine($"[HDI-MOUNT] Game executable not found: '{gamePath}'");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                Console.Error.WriteLine($"[HDI-MOUNT] FAT16 init failed for drive B:");
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"[HDI-MOUNT] Failed to load HDI: {ex.Message}");
+                        Console.Error.WriteLine(ex.StackTrace);
+                    }
                 }
 
                 if (hasAudio)

@@ -43,6 +43,8 @@ public class CompatibleBios
     // 0xE8200 is taken by BootLoader.BOOT_RETURN_STUB, so use 0xE8210
     private const int INT21_ADDR = 0xE8210; // DOS functions
     private const int INT2F_ADDR = 0xE8220; // Multiplex interrupt
+    private const int INT2A_ADDR = 0xE8240; // Network/critical section (IRET stub)
+    private const int INT41_SOUND_ADDR = 0xE8250; // Sound driver stub (奏楽管弦)
 
     // BDA addresses
     private const int BDA_MEMORY_SIZE = 0x0458;   // Main memory size in KB (word)
@@ -87,6 +89,11 @@ public class CompatibleBios
     public void SetFat16Reader(PC98Emu.Disk.Fat16Reader reader)
     {
         _dosBios?.SetFat16Reader(reader);
+    }
+
+    public void SetFat16ReaderForDrive(int drive, PC98Emu.Disk.Fat16Reader reader)
+    {
+        _dosBios?.SetFat16ReaderForDrive(drive, reader);
     }
 
     public void SetDiskManager(DiskManager diskManager)
@@ -293,6 +300,16 @@ public class CompatibleBios
         WriteBiosEntry(INT2F_ADDR);
         _cpu.RegisterBiosHandler(INT2F_ADDR, HandleInt2FDirect);
         WriteIVTEntry(0x2F, INT2F_ADDR);
+
+        // INT 2Ah (Network/Critical Section) - just IRET
+        // C runtime overlay managers call INT 2Ah for critical sections
+        WriteBiosEntry(INT2A_ADDR);
+        _cpu.RegisterBiosHandler(INT2A_ADDR, () => { DoIret(); });
+        WriteIVTEntry(0x2A, INT2A_ADDR);
+
+        // Sound driver stub (奏楽管弦 by NIHON CREATE) at INT 41h
+        // Games check for "FM&PCM" signature at handler+2
+        WriteSoundDriverStub();
 
         // Protect BIOS ROM
         _bus.SetBiosRomArea(true);
@@ -555,9 +572,8 @@ public class CompatibleBios
                 _cpu.AL = 0x00;
                 _cpu.Flags.CF = true;
                 break;
-            case 0x12: // DOS internal (used byAZSTTY.COM, command.com etc.)
-                // Subfunction in AL
-                _cpu.Flags.CF = false;
+            case 0x12: // DOS internal services
+                HandleInt2FDosInternal();
                 break;
             case 0x15: // MSCDEX - not installed
                 _cpu.AL = 0x00;
@@ -581,6 +597,81 @@ public class CompatibleBios
     private void HandleInt2FDirect()
     {
         HandleInt2F();
+        DoIret();
+    }
+
+    /// <summary>
+    /// Handle INT 2F AH=12 (DOS internal services).
+    /// </summary>
+    private void HandleInt2FDosInternal()
+    {
+        byte subfunc = _cpu.AL;
+        switch (subfunc)
+        {
+            case 0x2E: // Get SFT entry address
+            {
+                // BX = SFT entry index (file handle number)
+                int handleIndex = _cpu.BX;
+                if (_dosBios != null && handleIndex >= 0 && handleIndex < 40)
+                {
+                    var (seg, off) = _dosBios.GetSftEntryAddress(handleIndex);
+                    _cpu.ES = seg;
+                    _cpu.DI = off;
+                    Console.Error.WriteLine($"[INT2F] AX=122E GetSFT handle={handleIndex} → {seg:X4}:{off:X4}");
+                }
+                else
+                {
+                    // Invalid handle - return error
+                    _cpu.AL = 0xFF;
+                    Console.Error.WriteLine($"[INT2F] AX=122E GetSFT handle={handleIndex} → invalid");
+                }
+                _cpu.Flags.CF = false;
+                break;
+            }
+            default:
+                // Other DOS internal services - just succeed
+                _cpu.Flags.CF = false;
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Write sound driver stub (奏楽管弦) into BIOS ROM at INT41_SOUND_ADDR.
+    /// Layout: EB 07 "FM&PCM\0" CF (JMP over signature, then IRET)
+    /// Games detect the driver by reading the "FM&PCM" signature at handler+2.
+    /// </summary>
+    private void WriteSoundDriverStub()
+    {
+        // Stub bytes: JMP +7, "FM&PCM\0", IRET
+        byte[] stub = new byte[] {
+            0xEB, 0x07,                              // +0: JMP SHORT +7 (to +9)
+            0x46, 0x4D, 0x26, 0x50, 0x43, 0x4D, 0x00, // +2: "FM&PCM\0"
+            0xCF                                      // +9: IRET
+        };
+        for (int i = 0; i < stub.Length; i++)
+            _bus.WriteBiosDirectly(INT41_SOUND_ADDR + i, stub[i]);
+
+        // Register BIOS handler so sound API calls are handled gracefully
+        _cpu.RegisterBiosHandler(INT41_SOUND_ADDR, HandleInt41Sound);
+
+        // Set IVT[41h] to point to our stub
+        WriteIVTEntry(0x41, INT41_SOUND_ADDR);
+
+        Console.Error.WriteLine($"[SOUND] Installed sound driver stub (奏楽管弦) at INT 41h → {INT41_SOUND_ADDR:X5}");
+    }
+
+    /// <summary>
+    /// INT 41h sound driver stub handler.
+    /// Accepts all sound commands and returns success without playing audio.
+    /// </summary>
+    private void HandleInt41Sound()
+    {
+        byte ah = _cpu.AH;
+        Console.Error.WriteLine($"[SOUND] INT 41h AH={ah:X2} AL={_cpu.AL:X2} BX={_cpu.BX:X4} CX={_cpu.CX:X4} DX={_cpu.DX:X4}");
+
+        // Return success for all commands (AX=0 typically means OK)
+        _cpu.AX = 0;
+        _cpu.Flags.CF = false;
         DoIret();
     }
 }

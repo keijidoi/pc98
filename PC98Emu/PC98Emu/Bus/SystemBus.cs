@@ -1,3 +1,5 @@
+using PC98Emu.Graphics;
+
 namespace PC98Emu.Bus;
 
 public class SystemBus
@@ -8,6 +10,7 @@ public class SystemBus
 
     public byte GvramDisplayPlane;
     public byte GvramWritePlane;
+    public GRCG? Grcg; // Set by Emulator after construction
 
     public void RegisterDevice(IDevice device)
     {
@@ -26,6 +29,15 @@ public class SystemBus
     public byte ReadMemoryByte(int address)
     {
         address &= 0xFFFFF;
+
+        // GRCG TCR mode: intercept GVRAM reads
+        if (Grcg != null && Grcg.Enabled && (Grcg.Mode & 0xC0) == 0x80
+            && address >= 0xA8000 && address <= 0xBFFFF)
+        {
+            int gvramOffset = (address - 0xA8000) % 0x8000;
+            return Grcg.ReadGvram(_memory, gvramOffset);
+        }
+
         return _memory[address];
     }
 
@@ -64,6 +76,15 @@ public class SystemBus
             if (_textVramTraceEnabled && TextVramWriteCount <= 10)
                 Console.Error.WriteLine($"[TVRAM] Write #{TextVramWriteCount} addr=0x{address:X5} val=0x{value:X2}");
         }
+
+        // GRCG intercept: GVRAM writes in range 0xA8000-0xBFFFF when GRCG is active
+        if (Grcg != null && Grcg.Enabled && address >= 0xA8000 && address <= 0xBFFFF)
+        {
+            int gvramOffset = (address - 0xA8000) % 0x8000; // Offset within one plane
+            Grcg.WriteGvram(_memory, gvramOffset, value);
+            return;
+        }
+
         _memory[address] = value;
     }
 

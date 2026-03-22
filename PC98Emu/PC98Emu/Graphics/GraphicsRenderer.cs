@@ -15,6 +15,7 @@ public class GraphicsRenderer
 {
     private readonly byte[] _memory;
     private readonly SystemBus _bus;
+    private readonly AnalogPalette? _palette;
 
     private const int PlaneSize = 32000; // 640 * 400 / 8
 
@@ -27,31 +28,20 @@ public class GraphicsRenderer
     private const int GvramStart = 0xA8000;
     private const int GvramEnd = 0xBFFFF;
 
-    // Default 16-color digital palette (ARGB)
+    // Fallback 16-color digital palette (used if no analog palette)
     private static readonly uint[] DefaultPalette = new uint[]
     {
-        0xFF000000, // 0: Black
-        0xFF0000AA, // 1: Blue
-        0xFFAA0000, // 2: Red
-        0xFFAA00AA, // 3: Magenta
-        0xFF00AA00, // 4: Green
-        0xFF00AAAA, // 5: Cyan
-        0xFFAAAA00, // 6: Yellow
-        0xFFAAAAAA, // 7: White (light gray)
-        0xFF555555, // 8: Dark gray
-        0xFF5555FF, // 9: Bright blue
-        0xFFFF5555, // 10: Bright red
-        0xFFFF55FF, // 11: Bright magenta
-        0xFF55FF55, // 12: Bright green
-        0xFF55FFFF, // 13: Bright cyan
-        0xFFFFFF55, // 14: Bright yellow
-        0xFFFFFFFF, // 15: Bright white
+        0xFF000000, 0xFF0000AA, 0xFFAA0000, 0xFFAA00AA,
+        0xFF00AA00, 0xFF00AAAA, 0xFFAAAA00, 0xFFAAAAAA,
+        0xFF555555, 0xFF5555FF, 0xFFFF5555, 0xFFFF55FF,
+        0xFF55FF55, 0xFF55FFFF, 0xFFFFFF55, 0xFFFFFFFF,
     };
 
-    public GraphicsRenderer(byte[] memory, SystemBus bus)
+    public GraphicsRenderer(byte[] memory, SystemBus bus, AnalogPalette? palette = null)
     {
         _memory = memory;
         _bus = bus;
+        _palette = palette;
     }
 
     /// <summary>
@@ -79,7 +69,7 @@ public class GraphicsRenderer
                                | ((p1 >> bit) & 1) << 1
                                | ((p0 >> bit) & 1);
 
-                framebuffer[pixelIndex] = DefaultPalette[colorIndex];
+                framebuffer[pixelIndex] = _palette != null ? _palette.Palette[colorIndex] : DefaultPalette[colorIndex];
             }
         }
     }
